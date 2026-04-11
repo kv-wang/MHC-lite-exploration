@@ -12,3 +12,10 @@ env/
 venv/
 wandb
 
+# Local dataset caches and downloads
+data/fineweb_edu/HuggingFaceFW___fineweb-edu/
+data/fineweb_edu/downloads/
+data/fineweb_edu/modules/
+
+# Large local archives
+*.tar.gz

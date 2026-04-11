@@ -205,7 +205,9 @@ class ManifoldConstrainedHyperConnections(Module):
         num_input_views = 1,                # allow for the branch module to receive multiple input views, dimension placed on the very left (before batch)
         depth_residual_fn = add,
         num_fracs = 1,                      # https://arxiv.org/abs/2503.14125
-        sinkhorn_iters = 20
+        sinkhorn_iters = 20,
+        mhc_gate_fn = "sigmoid",
+        mhc_identity_h_res = False,
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
@@ -295,6 +297,8 @@ class ManifoldConstrainedHyperConnections(Module):
         # sinkhorn related
 
         self.sinkhorn_iters = sinkhorn_iters
+        self.mhc_gate_fn = mhc_gate_fn
+        self.mhc_identity_h_res = mhc_identity_h_res
 
         # dropouts
 
@@ -363,11 +367,21 @@ class ManifoldConstrainedHyperConnections(Module):
         # (..., 1, s, 1, v) / (..., 1, s, 1, s)
         alpha_pre, alpha_residual = alpha[..., :self.num_input_views], alpha[..., self.num_input_views:]
 
-        alpha_pre = alpha_pre.sigmoid() 
+        if self.mhc_gate_fn == "softmax":
+            alpha_pre = F.softmax(alpha_pre, dim=-1)
+        else:
+            alpha_pre = alpha_pre.sigmoid()
 
-        alpha_residual = rearrange(alpha_residual, '... f s g t -> ... f g s t')
-        alpha_residual = sinkhorn_knopps(alpha_residual, self.sinkhorn_iters)
-        alpha_residual = rearrange(alpha_residual, '... f g s t -> ... f s g t')
+        if self.mhc_identity_h_res:
+            streams = self.num_residual_streams
+            alpha_residual = torch.eye(
+                streams, device=alpha_residual.device, dtype=alpha_residual.dtype
+            ).expand_as(alpha_residual[..., :streams, :streams])
+            alpha_residual = self.split_fracs(alpha_residual)
+        else:
+            alpha_residual = rearrange(alpha_residual, '... f s g t -> ... f g s t')
+            alpha_residual = sinkhorn_knopps(alpha_residual, self.sinkhorn_iters)
+            alpha_residual = rearrange(alpha_residual, '... f g s t -> ... f s g t')
 
         alpha = cat((alpha_pre, alpha_residual), dim = -1) # (..., f, s, f, s+v)
 
@@ -383,7 +397,10 @@ class ManifoldConstrainedHyperConnections(Module):
             static_beta = rearrange(self.static_beta, '... (s f) -> ... s f', s = streams)
 
             beta = dynamic_beta + static_beta
-            beta = beta.sigmoid() * 2 # sigmoid * 2 for "H_post"
+            if self.mhc_gate_fn == "softmax":
+                beta = F.softmax(beta, dim=-2)
+            else:
+                beta = beta.sigmoid() * 2
 
         mix_h = einsum(alpha, residuals, '... f1 s f2 t, ... f1 s d -> ... f2 t d')
 
@@ -395,8 +412,6 @@ class ManifoldConstrainedHyperConnections(Module):
 
         if self.channel_first:
             branch_input = rearrange(branch_input, 'b ... d -> b d ...')
-
-        # maybe merge fractions back
 
         branch_input = self.merge_fracs(branch_input)
 

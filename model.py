@@ -15,6 +15,10 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from hyper_conn import hyper_conn_init_func
+from hyper_conn.attention_residuals import (
+    AttentionResidualMixer,
+    BlockAttentionResidualMixer,
+)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -94,11 +98,14 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config, init_hc, expand_stream, reduce_stream):
+    def __init__(self, config, init_hc, expand_stream, reduce_stream, attn_res_mixer=None, step_offset=0):
         super().__init__()
         self.init_hc = init_hc
         self.expand_stream = expand_stream
         self.reduce_stream = reduce_stream
+        self.attn_res_mixer = attn_res_mixer
+        self.attn_res_attn_step = step_offset
+        self.attn_res_mlp_step = step_offset + 1
 
         self.branch_attn = nn.Sequential(
             LayerNorm(config.n_embd, bias=config.bias), 
@@ -120,13 +127,19 @@ class Block(nn.Module):
             )
 
     def forward(self, x):
-        exp_s = self.expand_stream
-        rdc_s = self.reduce_stream
-        
         if self.init_hc is not None:
-            assert exp_s is not None and rdc_s is not None
+            if self.attn_res_mixer is not None:
+                x = self.attn_res_mixer.prepare_input(self.attn_res_attn_step)
             x = self.hc_attn(x)
+            if self.attn_res_mixer is not None:
+                self.attn_res_mixer.record(x)
+                x = self.attn_res_mixer.prepare_input(self.attn_res_mlp_step)
             x = self.hc_mlp(x)
+            if self.attn_res_mixer is not None:
+                self.attn_res_mixer.record(x)
+        elif self.attn_res_mixer is not None:
+            x = self.attn_res_mixer.apply_branch(self.attn_res_attn_step, self.branch_attn)
+            x = self.attn_res_mixer.apply_branch(self.attn_res_mlp_step, self.branch_mlp)
         else:
             x = x + self.branch_attn(x)
             x = x + self.branch_mlp(x)
@@ -143,6 +156,11 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     hyper_conn_n: int = 1
     hyper_conn_type: str = "none"
+    mhc_gate_fn: str = "sigmoid"
+    mhc_identity_h_res: bool = False
+    mhc_lite_method: str = "base"
+    mhc_lite_perm_topk: int = 0
+    mhc_lite_block_size: int = 4
 
 class GPT(nn.Module):
 
@@ -152,12 +170,41 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        init_hc, expand_stream, reduce_stream = hyper_conn_init_func(
-            config.hyper_conn_type , 
-            config.hyper_conn_n , 
+        hc_kwargs = dict(
+            mhc_gate_fn=config.mhc_gate_fn,
+            mhc_identity_h_res=config.mhc_identity_h_res,
         )
+        if config.hyper_conn_type == "mhc_lite":
+            hc_kwargs.update(
+                mhc_lite_method=config.mhc_lite_method,
+                mhc_lite_perm_topk=config.mhc_lite_perm_topk,
+            )
+
+        if config.hyper_conn_type == "attn_res":
+            init_hc, expand_stream, reduce_stream = None, None, None
+            attn_res_mixer = AttentionResidualMixer(num_steps=2 * config.n_layer, dim=config.n_embd)
+        else:
+            init_hc, expand_stream, reduce_stream = hyper_conn_init_func(
+                config.hyper_conn_type,
+                config.hyper_conn_n,
+                **hc_kwargs,
+            )
+            if config.hyper_conn_type == "mhc_lite" and config.mhc_lite_method == "depth_attn":
+                attn_res_mixer = AttentionResidualMixer(
+                    num_steps=2 * config.n_layer,
+                    dim=config.n_embd,
+                )
+            elif config.hyper_conn_type == "mhc_lite" and config.mhc_lite_method == "block_attn":
+                attn_res_mixer = BlockAttentionResidualMixer(
+                    num_steps=2 * config.n_layer,
+                    dim=config.n_embd,
+                    block_size=config.mhc_lite_block_size,
+                )
+            else:
+                attn_res_mixer = None
         self.expand_stream = expand_stream
         self.reduce_stream = reduce_stream
+        self.attn_res_mixer = attn_res_mixer
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -168,8 +215,10 @@ class GPT(nn.Module):
                     config, 
                     init_hc, 
                     expand_stream, 
-                    reduce_stream, 
-                ) for _ in range(config.n_layer)
+                    reduce_stream,
+                    attn_res_mixer=attn_res_mixer,
+                    step_offset=2 * i,
+                ) for i in range(config.n_layer)
             ]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
@@ -222,8 +271,12 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         if self.expand_stream is not None:
             x = self.expand_stream(x)
+        if self.attn_res_mixer is not None:
+            self.attn_res_mixer.reset(x)
         for block in self.transformer.h:
             x = block(x)
+        if self.attn_res_mixer is not None:
+            x = self.attn_res_mixer.finalize()
         x = self.transformer.ln_f(x)
         if self.reduce_stream is not None:
             x = self.reduce_stream(x)

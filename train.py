@@ -24,6 +24,7 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -32,7 +33,6 @@ from pprint import pprint
 import warnings
 import json
 import glob
-import random 
 
 # suppress FutureWarning
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -40,9 +40,13 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # ----- hyper conn start -----
-hyper_conn_type = "none" # none, hc, mhc, mhc_lite
+hyper_conn_type = "none" # none, hc, mhc, mhc_lite, attn_res
 hyper_conn_n = 1 # num_streams
-
+mhc_gate_fn = "sigmoid"    # "softmax" or "sigmoid" for H_pre/H_post (mhc/mhc_lite only)
+mhc_identity_h_res = False # True = H_res fixed to I, no stream mixing (mhc/mhc_lite only)
+mhc_lite_method = "base"   # base, selective, depth_attn, block_attn
+mhc_lite_perm_topk = 0     # selective only; 0 defaults to num_streams
+mhc_lite_block_size = 4    # block_attn only; measured in sublayers
 # ----- hyper conn end -----
 
 # I/O
@@ -63,6 +67,11 @@ wandb_project = 'owt'
 wandb_run_name = 'exp' # 'run' + str(time.time())
 wandb_group = "default"
 wandb_notes = ""
+wandb_log_layer_stats = True
+wandb_log_layer_cosine = True
+wandb_log_layer_grad_norm = True
+wandb_log_layer_activation_norm = True
+wandb_log_layer_activation_grad_norm = True
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -95,7 +104,29 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
+# auto-generate descriptive wandb_run_name and out_prefix_method
+if wandb_run_name == 'exp':
+    if hyper_conn_type == "none":
+        wandb_run_name = "residual"
+    elif hyper_conn_type == "hc":
+        wandb_run_name = "hc"
+    elif hyper_conn_type in ("mhc", "mhc_lite"):
+        tag = hyper_conn_type.replace("_", "-")
+        if hyper_conn_type == "mhc_lite" and mhc_lite_method != "base":
+            tag += f"-{mhc_lite_method.replace('_', '-')}"
+        tag += f"-{mhc_gate_fn}"
+        if mhc_identity_h_res:
+            tag += "-idH"
+        wandb_run_name = tag
+    elif hyper_conn_type == "attn_res":
+        wandb_run_name = "attn-res"
+    else:
+        wandb_run_name = hyper_conn_type
+
+if out_prefix_method == "residual" and hyper_conn_type != "none":
+    out_prefix_method = wandb_run_name
+
+config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
@@ -124,7 +155,7 @@ if wandb_log and master_process:
     import wandb
     wandb.init(
         project = wandb_project , 
-        name    = wandb_run_name + '-' + str(random.randint(1000,9999)), 
+        name    = wandb_run_name,
         group   = wandb_group,
         config  = config , 
         notes   = wandb_notes,
@@ -145,7 +176,10 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+if dataset == 'openwebtext':
+    data_dir = '/root/autodl-tmp/MHC/examples/nanogpt/data/openwebtext'
+else:
+    data_dir = os.path.join('data', dataset)
 
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
@@ -194,8 +228,13 @@ model_args = dict(
     vocab_size=vocab_size, 
     dropout=dropout,
     hyper_conn_n=hyper_conn_n,
-    hyper_conn_type=hyper_conn_type
-) # start with model_args from command line
+    hyper_conn_type=hyper_conn_type,
+    mhc_gate_fn=mhc_gate_fn,
+    mhc_identity_h_res=mhc_identity_h_res,
+    mhc_lite_method=mhc_lite_method,
+    mhc_lite_perm_topk=mhc_lite_perm_topk,
+    mhc_lite_block_size=mhc_lite_block_size,
+)
 if master_process:
     print ("="*100)
     for k, v in model_args.items():
@@ -267,78 +306,308 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
-# helps estimate an arbitrarily accurate loss over either split using many batches
+# learning rate decay scheduler (cosine with warmup)
+def get_lr(it):
+    if it < warmup_iters:
+        return learning_rate * (it + 1) / (warmup_iters + 1)
+    if it > lr_decay_iters:
+        return min_lr
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (learning_rate - min_lr)
+
+
+# ---------------------------------------------------------------------------
+# Layer-level diagnostics (ported from MHC)
+# ---------------------------------------------------------------------------
+
+raw_model = model.module if ddp else model
+
+def _get_hc_modules(block):
+    if hasattr(block, 'hc_attn') and hasattr(block, 'hc_mlp'):
+        return block.hc_attn, block.hc_mlp
+    return None, None
+
+_has_hc_modules = any(
+    _get_hc_modules(block)[0] is not None for block in raw_model.transformer.h
+)
+
+
+def collect_hc_layer_stats():
+    layer_count = len(raw_model.transformer.h) * 2
+    layer_stats = {}
+    for block_idx, block in enumerate(raw_model.transformer.h):
+        hc_attn, hc_mlp = _get_hc_modules(block)
+        if hc_attn is None:
+            continue
+        for sub_idx, hc in enumerate((hc_attn, hc_mlp)):
+            if not hasattr(hc, "last_stats"):
+                continue
+            layer_index = block_idx * 2 + sub_idx
+            for key, value in hc.last_stats.items():
+                layer_stats.setdefault(key, [None] * layer_count)
+                layer_stats[key][layer_index] = value.item()
+    return layer_stats
+
+
+def build_layer_table(layer_stats):
+    if not layer_stats:
+        return None
+    keys = sorted(layer_stats.keys())
+    layer_count = max(len(v) for v in layer_stats.values())
+    table = wandb.Table(columns=["layer"] + keys)
+    for i in range(layer_count):
+        row_vals = []
+        for key in keys:
+            values = layer_stats[key]
+            val = values[i] if i < len(values) else None
+            row_vals.append(val)
+        if all(v is None for v in row_vals):
+            continue
+        table.add_data(i, *row_vals)
+    return table
+
+
+def _activation_norm_hook(module, _, output):
+    if isinstance(output, (tuple, list)):
+        output = output[0]
+    if not torch.is_tensor(output):
+        return
+    activation_norm = torch.linalg.vector_norm(output.detach().float()).item()
+    module._activation_norm_sum = (
+        getattr(module, "_activation_norm_sum", 0.0) + activation_norm
+    )
+    module._activation_norm_count = getattr(module, "_activation_norm_count", 0) + 1
+    if output.requires_grad:
+        output.register_hook(lambda grad: _activation_grad_norm_hook(module, grad))
+
+
+def _activation_grad_norm_hook(module, grad):
+    if not torch.is_tensor(grad):
+        return
+    activation_grad_norm = torch.linalg.vector_norm(grad.detach().float()).item()
+    module._activation_grad_norm_sum = (
+        getattr(module, "_activation_grad_norm_sum", 0.0) + activation_grad_norm
+    )
+    module._activation_grad_norm_count = (
+        getattr(module, "_activation_grad_norm_count", 0) + 1
+    )
+
+
+def reset_layer_activation_norms():
+    for block in raw_model.transformer.h:
+        hc_attn, hc_mlp = _get_hc_modules(block)
+        if hc_attn is None:
+            continue
+        for module in (hc_attn, hc_mlp):
+            module._activation_norm_sum = 0.0
+            module._activation_norm_count = 0
+            module._activation_grad_norm_sum = 0.0
+            module._activation_grad_norm_count = 0
+
+
+def collect_layer_activation_norms():
+    rows = []
+    for block_idx, block in enumerate(raw_model.transformer.h):
+        hc_attn, hc_mlp = _get_hc_modules(block)
+        if hc_attn is None:
+            continue
+        for sub_idx, (name, module) in enumerate(
+            (("attn", hc_attn), ("mlp", hc_mlp))
+        ):
+            count = getattr(module, "_activation_norm_count", 0)
+            if count <= 0:
+                continue
+            layer_index = block_idx * 2 + sub_idx
+            activation_norm = getattr(module, "_activation_norm_sum", 0.0) / count
+            rows.append((layer_index, name, activation_norm))
+    return rows
+
+
+def build_layer_scalar_log(prefix, rows):
+    if not rows:
+        return {}
+    return {
+        f"{prefix}/layer_{layer_index}_{component}": value
+        for layer_index, component, value in rows
+    }
+
+
+def collect_layer_activation_grad_norms():
+    rows = []
+    for block_idx, block in enumerate(raw_model.transformer.h):
+        hc_attn, hc_mlp = _get_hc_modules(block)
+        if hc_attn is None:
+            continue
+        for sub_idx, (name, module) in enumerate(
+            (("attn", hc_attn), ("mlp", hc_mlp))
+        ):
+            count = getattr(module, "_activation_grad_norm_count", 0)
+            if count <= 0:
+                continue
+            layer_index = block_idx * 2 + sub_idx
+            activation_grad_norm = (
+                getattr(module, "_activation_grad_norm_sum", 0.0) / count
+            )
+            rows.append((layer_index, name, activation_grad_norm))
+    return rows
+
+
+def _module_grad_norm(module):
+    total_sq = None
+    for param in module.parameters():
+        if param.grad is None:
+            continue
+        grad_sq = param.grad.detach().float().pow(2).sum()
+        total_sq = grad_sq if total_sq is None else total_sq + grad_sq
+    if total_sq is None:
+        return None
+    return torch.sqrt(total_sq).item()
+
+
+def collect_layer_grad_norms():
+    rows = []
+    for block_idx, block in enumerate(raw_model.transformer.h):
+        hc_attn, hc_mlp = _get_hc_modules(block)
+        if hc_attn is None:
+            continue
+        for sub_idx, (name, module) in enumerate(
+            (("attn", hc_attn), ("mlp", hc_mlp))
+        ):
+            grad_norm = _module_grad_norm(module)
+            if grad_norm is None:
+                continue
+            layer_index = block_idx * 2 + sub_idx
+            rows.append((layer_index, name, grad_norm))
+    return rows
+
+
+def forward_with_layer_cosine(x, y):
+    sims = []
+    prev = [None]
+    handles = []
+
+    def hook(_, __, output):
+        out = output.detach()
+        if prev[0] is not None:
+            prev_flat = prev[0].reshape(-1, prev[0].shape[-1])
+            out_flat = out.reshape(-1, out.shape[-1])
+            sim = F.cosine_similarity(prev_flat, out_flat, dim=-1).mean()
+            sims.append(sim)
+        prev[0] = out
+
+    for block in raw_model.transformer.h:
+        handles.append(block.register_forward_hook(hook))
+
+    with ctx:
+        _, loss = model(x, y)
+
+    for handle in handles:
+        handle.remove()
+
+    sims = [s.item() for s in sims]
+    return loss, sims
+
+
+if wandb_log and _has_hc_modules and (
+    wandb_log_layer_stats
+    or wandb_log_layer_activation_norm
+    or wandb_log_layer_activation_grad_norm
+):
+    for block in raw_model.transformer.h:
+        hc_attn, hc_mlp = _get_hc_modules(block)
+        if hc_attn is None:
+            continue
+        for hc in (hc_attn, hc_mlp):
+            if wandb_log_layer_stats and hasattr(hc, 'collect_stats'):
+                hc.collect_stats = True
+            if wandb_log_layer_activation_norm or wandb_log_layer_activation_grad_norm:
+                hc.register_forward_hook(_activation_norm_hook)
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
 @torch.no_grad()
 def estimate_loss():
     out = {}
+    layer_cosine = None
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
+            if (
+                layer_cosine is None
+                and wandb_log
+                and wandb_log_layer_cosine
+                and split == "train"
+                and k == 0
+            ):
+                loss, layer_cosine = forward_with_layer_cosine(X, Y)
+            else:
+                with ctx:
+                    _, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
-    return out
-
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+    return out, layer_cosine
 
 
-# training loop
-X, Y = get_batch('train') # fetch the very first batch
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
+X, Y = get_batch('train')
 t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
+local_iter_num = 0
 running_mfu = -1.0
 train_losses = []
-tpss = [] # token per second
+tpss = []
 grad_norms = []
 while True:
 
-    # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # evaluate the loss on train/val sets and write checkpoints
+    # evaluate
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
+        losses, layer_cosine = estimate_loss()
         avg_train_loss = [np.mean(train_losses), np.std(train_losses)] if len(train_losses) > 0 else [0, 0]
-        avg_grad_norm = [np.mean(grad_norms), np.std(grad_norms)] if len(grad_norms) > 0 else [0, 0]
+        avg_grad_norm_val = [np.mean(grad_norms), np.std(grad_norms)] if len(grad_norms) > 0 else [0, 0]
 
         desc = f"[step {iter_num}]" + ", ".join([
-            f"train loss: {losses['train']:.4f}" , 
-            f"val loss: {losses['val']:.4f}" , 
-            f"(avg train loss: {avg_train_loss[0]:.4f} ± {avg_train_loss[1]:.4f})" , 
-            f"(avg grad norm: {avg_grad_norm[0]:.4f} ± {avg_grad_norm[1]:.4f})" , 
+            f"train loss: {losses['train']:.4f}",
+            f"val loss: {losses['val']:.4f}",
+            f"(avg train loss: {avg_train_loss[0]:.4f} ± {avg_train_loss[1]:.4f})",
+            f"(avg grad norm: {avg_grad_norm_val[0]:.4f} ± {avg_grad_norm_val[1]:.4f})",
         ])
         print(desc)
 
-
         if wandb_log:
-            wandb.log({
+            eval_log = {
                 "iter": iter_num,
                 "train/loss_est": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
+                "mfu": running_mfu * 100,
                 "train/avg_loss": avg_train_loss[0],
-                "train/avg_gnorm": avg_grad_norm[0],
-            }, step=iter_num)
+                "train/avg_gnorm": avg_grad_norm_val[0],
+            }
+            wandb.log(eval_log, step=iter_num)
+            if wandb_log_layer_cosine and layer_cosine is not None:
+                layer_table = wandb.Table(columns=["layer", "cosine"])
+                for idx, value in enumerate(layer_cosine):
+                    layer_table.add_data(idx, value)
+                wandb.log({"hc/layer_cosine": layer_table}, step=iter_num)
+            if wandb_log_layer_stats and _has_hc_modules:
+                layer_stats = collect_hc_layer_stats()
+                layer_stats_table = build_layer_table(layer_stats)
+                if layer_stats_table is not None:
+                    wandb.log({"hc/layer_stats": layer_stats_table}, step=iter_num)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -354,39 +623,47 @@ while True:
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
-    
+
+    # training step with gradient accumulation
+    optimizer.zero_grad(set_to_none=True)
+    if wandb_log and (
+        wandb_log_layer_activation_norm
+        or wandb_log_layer_activation_grad_norm
+    ) and _has_hc_modules:
+        reset_layer_activation_norms()
+
     train_time_start = time.time()
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            loss = loss / gradient_accumulation_steps
         X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
-    # clip the gradient
+
+    # gradient clipping + collect diagnostics
     grad_norm = -1.
+    layer_grad_norms = None
+    layer_activation_norms = None
+    layer_activation_grad_norms = None
     if grad_clip > 0.:
         scaler.unscale_(optimizer)
+        if wandb_log and wandb_log_layer_activation_norm and _has_hc_modules:
+            layer_activation_norms = collect_layer_activation_norms()
+        if wandb_log and wandb_log_layer_activation_grad_norm and _has_hc_modules:
+            layer_activation_grad_norms = collect_layer_activation_grad_norms()
+        if wandb_log and wandb_log_layer_grad_norm and _has_hc_modules:
+            layer_grad_norms = collect_layer_grad_norms()
         ret_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         grad_norm = float(ret_grad_norm)
-    # step the optimizer and scaler if training in fp16
+
     scaler.step(optimizer)
     scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
     train_time_end = time.time()
     d_train_time = train_time_end - train_time_start
     tokens_per_sec = tokens_per_iter / d_train_time
-    
+
     tpss.append(tokens_per_sec)
     train_losses.append(float(loss))
     grad_norms.append(float(grad_norm))
@@ -395,40 +672,55 @@ while True:
     if len(grad_norms) > 200:
         grad_norms.pop(0)
 
-
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
+        if local_iter_num >= 5:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        
+            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+
         tokens_seen = iter_num * tokens_per_iter
 
         desc = f"[iter {iter_num}]" + ", ".join([
-            f"loss: {lossf:.4f}" , 
-            f"tokens/sec: {np.mean(tpss):.2f} ± {np.std(tpss):.2f}" if len(tpss) > 0 else "0.00 ± 0.00" , 
-            f"tokens seen: {tokens_seen}" , 
-            f"grad norm: {grad_norm:.4f}" , 
+            f"loss: {lossf:.4f}",
+            f"tokens/sec: {np.mean(tpss):.2f} ± {np.std(tpss):.2f}" if len(tpss) > 0 else "0.00 ± 0.00",
+            f"tokens seen: {tokens_seen}",
+            f"grad norm: {grad_norm:.4f}",
         ])
         if wandb_log:
-            wandb.log({
+            log_dict = {
                 "train/loss": lossf,
                 "train/tokens_per_sec": np.mean(tpss) if len(tpss) > 0 else 0,
                 "train/tokens_seen": tokens_seen,
                 "train/grad_norm": grad_norm,
-            }, step=iter_num)
+            }
+            if device_type == "cuda":
+                log_dict["perf/max_mem_allocated_mb"] = (
+                    torch.cuda.max_memory_allocated() / 1e6
+                )
+            wandb.log(log_dict, step=iter_num)
+            if wandb_log_layer_grad_norm and layer_grad_norms is not None:
+                lg = build_layer_scalar_log("train/layer_parameter_grad_norm", layer_grad_norms)
+                if lg:
+                    wandb.log(lg, step=iter_num)
+            if wandb_log_layer_activation_norm and layer_activation_norms is not None:
+                lg = build_layer_scalar_log("train/layer_activation_norm", layer_activation_norms)
+                if lg:
+                    wandb.log(lg, step=iter_num)
+            if wandb_log_layer_activation_grad_norm and layer_activation_grad_norms is not None:
+                lg = build_layer_scalar_log("train/layer_activation_grad_norm", layer_activation_grad_norms)
+                if lg:
+                    wandb.log(lg, step=iter_num)
+            if device_type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
 
         print(desc)
     iter_num += 1
     local_iter_num += 1
 
-    # termination conditions
     if iter_num > max_iters:
         break
 

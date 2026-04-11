@@ -1,8 +1,15 @@
 import os
 import numpy as np
 import tiktoken
-from datasets import load_dataset
 from tqdm import tqdm
+
+DATA_DIR = "/root/autodl-tmp/mhc-lite/data/fineweb_edu"
+
+# Keep the Hugging Face dataset cache under the project data directory.
+os.environ["HF_HOME"] = DATA_DIR
+os.environ["HF_DATASETS_CACHE"] = DATA_DIR
+
+from datasets import load_dataset
 
 NUM_PROC = 8  
 SHARD_SIZE = int(1e8)
@@ -50,7 +57,7 @@ def save_to_bin(dset, filename, batch_size=100000):
     
     print(f"Saved {filename}: {token_count:,} tokens")
     
-data_dir = os.path.dirname(os.path.abspath(__file__))
+data_dir = DATA_DIR
 
 for split, dset in tokenized.items():
     filename = os.path.join(data_dir, f'{split}.bin')

@@ -204,11 +204,21 @@ class MHCLite(Module):
         num_input_views = 1,                # allow for the branch module to receive multiple input views, dimension placed on the very left (before batch)
         depth_residual_fn = add,
         num_fracs = 1,                      # https://arxiv.org/abs/2503.14125
+        mhc_gate_fn = "sigmoid",
+        mhc_identity_h_res = False,
+        mhc_lite_method = "base",
+        mhc_lite_perm_topk = 0,
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
         """
         super().__init__()
+        valid_methods = {"base", "selective", "depth_attn", "block_attn"}
+        if mhc_lite_method not in valid_methods:
+            raise ValueError(f"Invalid mhc_lite_method: {mhc_lite_method}")
+        self.mhc_gate_fn = mhc_gate_fn
+        self.mhc_identity_h_res = mhc_identity_h_res
+        self.mhc_lite_method = mhc_lite_method
 
         self.branch = branch
 
@@ -234,6 +244,7 @@ class MHCLite(Module):
 
         self.num_residual_streams = num_residual_streams
         init_residual_index = default(layer_index, randrange(num_residual_streams)) % num_residual_streams # just choose one random residual stream if layer index not given
+        self.perm_topk = mhc_lite_perm_topk if mhc_lite_perm_topk > 0 else num_residual_streams
 
         # handle the parameter dimensions, which may require (num_residuals x num_fractions) - generalizing hyper + frac connections
 
@@ -358,15 +369,31 @@ class MHCLite(Module):
             _perm_mats = get_all_permutations(streams).to(dev)
             perm_mats[(streams, dev)] = _perm_mats
         perms = perm_mats[(streams, dev)]
-        res_coeff = self.residual_scale * dynamic_residual + static_residual
-        res_coeff = torch.softmax(res_coeff, dim = -1)
-        alpha_residual = einsum(res_coeff, perms, '... r, r i j-> ... i j') # (..., s, s)
-        alpha_residual = self.split_fracs(alpha_residual) # (..., f, s, f, s)
-        
-        # (..., f, s, f, v)
-        alpha_pre = self.pre_branch_scale * dynamic_pre + static_pre  # (..., s*v)
+        if self.mhc_identity_h_res:
+            alpha_residual = torch.eye(
+                streams, device=dynamic_residual.device, dtype=dynamic_residual.dtype
+            )
+            shape = list(dynamic_pre.shape[:-1]) + [streams, streams]
+            alpha_residual = alpha_residual.expand(shape)
+            alpha_residual = self.split_fracs(alpha_residual)
+        else:
+            res_coeff = self.residual_scale * dynamic_residual + static_residual
+            if self.mhc_lite_method == "selective":
+                topk = min(self.perm_topk, res_coeff.shape[-1])
+                if topk < res_coeff.shape[-1]:
+                    topk_vals, topk_idx = torch.topk(res_coeff, k=topk, dim=-1)
+                    masked = torch.full_like(res_coeff, float("-inf"))
+                    res_coeff = masked.scatter(-1, topk_idx, topk_vals)
+            res_coeff = torch.softmax(res_coeff, dim = -1)
+            alpha_residual = einsum(res_coeff, perms, '... r, r i j-> ... i j')
+            alpha_residual = self.split_fracs(alpha_residual)
+
+        alpha_pre = self.pre_branch_scale * dynamic_pre + static_pre
         alpha_pre = rearrange(alpha_pre, '... (f s v) -> ... s f v', v = self.num_input_views, f = self.num_fracs)
-        alpha_pre = alpha_pre.sigmoid()
+        if self.mhc_gate_fn == "softmax":
+            alpha_pre = F.softmax(alpha_pre, dim=-1)
+        else:
+            alpha_pre = alpha_pre.sigmoid()
 
         # the alpha is now split and "manifold constrained" with sinkhorn and sigmoid
 
@@ -384,7 +411,10 @@ class MHCLite(Module):
             static_beta = rearrange(self.static_beta, '... (s f) -> ... s f', s = streams)
 
             beta = dynamic_beta + static_beta
-            beta = beta.sigmoid() * 2 # sigmoid * 2 for "H_post"
+            if self.mhc_gate_fn == "softmax":
+                beta = F.softmax(beta, dim=-2)
+            else:
+                beta = beta.sigmoid() * 2
 
         mix_h = einsum(alpha, residuals, '... f1 s f2 t, ... f1 s d -> ... f2 t d')
 
