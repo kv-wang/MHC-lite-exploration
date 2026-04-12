@@ -10,43 +10,78 @@ class _BaseAttentionResidualMixer(nn.Module):
         self.dim = dim
         self.queries = nn.Parameter(torch.empty(num_steps + 1, dim))
         nn.init.normal_(self.queries, mean=0.0, std=0.02)
-        self.last_attn_stats = {}
+        self.last_stats = {}
+        self.collect_stats = False
 
-    def _rms_norm(self, x: torch.Tensor) -> torch.Tensor:
-        return F.normalize(x, dim=-1) * (self.dim ** 0.5)
+    def _source_scale(self, x: torch.Tensor) -> torch.Tensor:
+        norm = torch.linalg.vector_norm(x, dim=-1, keepdim=True)
+        return norm.clamp_min(1e-12).reciprocal() * (self.dim ** 0.5)
 
-    def _aggregate_values(self, step_idx: int, values) -> torch.Tensor:
+    def _aggregate_values(
+        self,
+        step_idx: int,
+        values,
+        source_scales=None,
+    ) -> torch.Tensor:
         if torch.is_tensor(values):
             value_sources = tuple(values.unbind(dim=-2))
         else:
             value_sources = tuple(values)
 
+        if source_scales is None:
+            scale_sources = (None,) * len(value_sources)
+        elif torch.is_tensor(source_scales):
+            scale_sources = tuple(source_scales.unbind(dim=-2))
+        else:
+            scale_sources = tuple(source_scales)
+
         if len(value_sources) == 0:
             raise RuntimeError("Attention mixer received no value sources")
+        if len(scale_sources) != len(value_sources):
+            raise RuntimeError("Attention mixer source scales do not match value sources")
 
-        query = self.queries[step_idx]
-        logits = []
+        if len(value_sources) == 1:
+            mixed = value_sources[0]
+            if self.collect_stats:
+                with torch.no_grad():
+                    self.last_stats = {
+                        "depth_sources": torch.tensor(1.0, device=mixed.device),
+                        "attn_entropy": torch.tensor(0.0, device=mixed.device),
+                        "attn_max": torch.tensor(1.0, device=mixed.device),
+                    }
+            return mixed
 
-        for value in value_sources:
-            key = self._rms_norm(value)
-            source_query = query.to(dtype=key.dtype)
-            logit = torch.einsum("d,btd->bt", source_query, key)
-            logits.append(logit.float())
+        query = self.queries[step_idx].to(dtype=value_sources[0].dtype)
+        attn_logits = torch.empty(
+            *value_sources[0].shape[:-1],
+            len(value_sources),
+            device=value_sources[0].device,
+            dtype=torch.float32,
+        )
 
-        attn = torch.stack(logits, dim=-1).softmax(dim=-1)
+        for source_idx, (value, source_scale) in enumerate(zip(value_sources, scale_sources)):
+            if source_scale is None:
+                source_scale = self._source_scale(value)
+            logit = torch.matmul(value.reshape(-1, value.shape[-1]), query)
+            logit = logit.view(*value.shape[:-1])
+            logit = logit * source_scale.squeeze(-1).to(dtype=logit.dtype)
+            attn_logits[..., source_idx] = logit.float()
+
+        attn = attn_logits.softmax(dim=-1)
 
         mixed = torch.zeros_like(value_sources[0])
         for source_idx, value in enumerate(value_sources):
             weight = attn[..., source_idx].to(dtype=value.dtype).unsqueeze(-1)
             mixed = mixed + value * weight
 
-        with torch.no_grad():
-            entropy = -(attn * attn.clamp_min(1e-9).log()).sum(dim=-1).mean()
-            self.last_attn_stats = {
-                "depth_sources": torch.tensor(float(len(value_sources)), device=mixed.device),
-                "attn_entropy": entropy.detach(),
-                "attn_max": attn.max(dim=-1).values.mean().detach(),
-            }
+        if self.collect_stats:
+            with torch.no_grad():
+                entropy = -(attn * attn.clamp_min(1e-9).log()).sum(dim=-1).mean()
+                self.last_stats = {
+                    "depth_sources": torch.tensor(float(len(value_sources)), device=mixed.device),
+                    "attn_entropy": entropy.detach(),
+                    "attn_max": attn.max(dim=-1).values.mean().detach(),
+                }
 
         return mixed
 
@@ -82,22 +117,26 @@ class AttentionResidualMixer(_BaseAttentionResidualMixer):
     def __init__(self, num_steps: int, dim: int):
         super().__init__(num_steps=num_steps, dim=dim)
         self._history = None
+        self._history_scales = None
 
     def reset(self, initial_state: torch.Tensor):
         self._history = [initial_state]
+        self._history_scales = [self._source_scale(initial_state)]
 
     def prepare_input(self, step_idx: int) -> torch.Tensor:
         if self._history is None or len(self._history) == 0:
             raise RuntimeError("AttentionResidualMixer must be reset before use")
-        return self._aggregate_values(step_idx, self._history)
+        return self._aggregate_values(step_idx, self._history, self._history_scales)
 
     def record(self, state: torch.Tensor):
         if self._history is None:
             raise RuntimeError("AttentionResidualMixer must be reset before use")
         self._history.append(state)
+        self._history_scales.append(self._source_scale(state))
 
     def _clear_state(self):
         self._history = None
+        self._history_scales = None
 
 
 class BlockAttentionResidualMixer(_BaseAttentionResidualMixer):
@@ -114,14 +153,20 @@ class BlockAttentionResidualMixer(_BaseAttentionResidualMixer):
             raise ValueError("block_size must be positive")
         self.block_size = block_size
         self._initial_state = None
+        self._initial_state_scale = None
         self._completed_blocks = None
+        self._completed_block_scales = None
         self._current_block_sum = None
+        self._current_block_scale = None
         self._current_block_count = 0
 
     def reset(self, initial_state: torch.Tensor):
         self._initial_state = initial_state
+        self._initial_state_scale = self._source_scale(initial_state)
         self._completed_blocks = []
+        self._completed_block_scales = []
         self._current_block_sum = None
+        self._current_block_scale = None
         self._current_block_count = 0
 
     def _value_sources(self):
@@ -131,10 +176,15 @@ class BlockAttentionResidualMixer(_BaseAttentionResidualMixer):
         values.extend(self._completed_blocks)
         if self._current_block_sum is not None:
             values.append(self._current_block_sum)
-        return values
+        scales = [self._initial_state_scale]
+        scales.extend(self._completed_block_scales)
+        if self._current_block_scale is not None:
+            scales.append(self._current_block_scale)
+        return values, scales
 
     def prepare_input(self, step_idx: int) -> torch.Tensor:
-        return self._aggregate_values(step_idx, self._value_sources())
+        value_sources, scale_sources = self._value_sources()
+        return self._aggregate_values(step_idx, value_sources, scale_sources)
 
     def record(self, state: torch.Tensor):
         if self._initial_state is None:
@@ -144,15 +194,21 @@ class BlockAttentionResidualMixer(_BaseAttentionResidualMixer):
             self._current_block_sum = state
         else:
             self._current_block_sum = self._current_block_sum + state
+        self._current_block_scale = self._source_scale(self._current_block_sum)
 
         self._current_block_count += 1
         if self._current_block_count >= self.block_size:
             self._completed_blocks.append(self._current_block_sum)
+            self._completed_block_scales.append(self._current_block_scale)
             self._current_block_sum = None
+            self._current_block_scale = None
             self._current_block_count = 0
 
     def _clear_state(self):
         self._initial_state = None
+        self._initial_state_scale = None
         self._completed_blocks = None
+        self._completed_block_scales = None
         self._current_block_sum = None
+        self._current_block_scale = None
         self._current_block_count = 0

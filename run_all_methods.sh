@@ -33,6 +33,8 @@ run_one() {
     torchrun --standalone --nproc_per_node="$N_GPUS" train.py \
       config/train_owt.py "$MODEL_CONFIG" \
       --wandb_project="$WANDB_PROJECT" \
+      --wandb_log_layer_stats=False \
+      --wandb_log_layer_cosine=False \
       "$@"
   else
     python train.py \
