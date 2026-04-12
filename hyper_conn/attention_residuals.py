@@ -15,49 +15,35 @@ class _BaseAttentionResidualMixer(nn.Module):
     def _rms_norm(self, x: torch.Tensor) -> torch.Tensor:
         return F.normalize(x, dim=-1) * (self.dim ** 0.5)
 
-    def _ensure_source_buffer(
-        self,
-        buffer: torch.Tensor | None,
-        example: torch.Tensor,
-        num_sources: int,
-    ) -> torch.Tensor:
-        expected_shape = (num_sources, *example.shape)
-        if (
-            buffer is None
-            or buffer.shape != expected_shape
-            or buffer.device != example.device
-            or buffer.dtype != example.dtype
-        ):
-            return example.new_empty(expected_shape)
-        return buffer
+    def _aggregate_values(self, step_idx: int, values) -> torch.Tensor:
+        if torch.is_tensor(values):
+            value_sources = tuple(values.unbind(dim=-2))
+        else:
+            value_sources = tuple(values)
 
-    def _aggregate_values(
-        self,
-        step_idx: int,
-        values,
-        keys: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if not torch.is_tensor(values):
-            values = torch.stack(tuple(values), dim=0)
-
-        if values.size(0) == 0:
+        if len(value_sources) == 0:
             raise RuntimeError("Attention mixer received no value sources")
 
-        if keys is None:
-            keys = self._rms_norm(values)
-
         query = self.queries[step_idx]
-        source_query = query.to(dtype=keys.dtype)
-        logits = (keys * source_query).sum(dim=-1).movedim(0, -1)
-        attn = logits.float().softmax(dim=-1)
+        logits = []
 
-        weights = attn.to(dtype=values.dtype).unsqueeze(-1)
-        mixed = (values.movedim(0, -2) * weights).sum(dim=-2)
+        for value in value_sources:
+            key = self._rms_norm(value)
+            source_query = query.to(dtype=key.dtype)
+            logit = torch.einsum("d,btd->bt", source_query, key)
+            logits.append(logit.float())
+
+        attn = torch.stack(logits, dim=-1).softmax(dim=-1)
+
+        mixed = torch.zeros_like(value_sources[0])
+        for source_idx, value in enumerate(value_sources):
+            weight = attn[..., source_idx].to(dtype=value.dtype).unsqueeze(-1)
+            mixed = mixed + value * weight
 
         with torch.no_grad():
             entropy = -(attn * attn.clamp_min(1e-9).log()).sum(dim=-1).mean()
             self.last_attn_stats = {
-                "depth_sources": torch.tensor(float(values.size(0)), device=mixed.device),
+                "depth_sources": torch.tensor(float(len(value_sources)), device=mixed.device),
                 "attn_entropy": entropy.detach(),
                 "attn_max": attn.max(dim=-1).values.mean().detach(),
             }
@@ -95,34 +81,23 @@ class AttentionResidualMixer(_BaseAttentionResidualMixer):
 
     def __init__(self, num_steps: int, dim: int):
         super().__init__(num_steps=num_steps, dim=dim)
-        self._history_buffer = None
-        self._history_count = 0
+        self._history = None
 
     def reset(self, initial_state: torch.Tensor):
-        self._history_buffer = self._ensure_source_buffer(
-            self._history_buffer,
-            initial_state,
-            self.num_steps + 1,
-        )
-        self._history_buffer[0].copy_(initial_state)
-        self._history_count = 1
+        self._history = [initial_state]
 
     def prepare_input(self, step_idx: int) -> torch.Tensor:
-        if self._history_buffer is None or self._history_count == 0:
+        if self._history is None or len(self._history) == 0:
             raise RuntimeError("AttentionResidualMixer must be reset before use")
-        return self._aggregate_values(
-            step_idx,
-            self._history_buffer[:self._history_count],
-        )
+        return self._aggregate_values(step_idx, self._history)
 
     def record(self, state: torch.Tensor):
-        if self._history_buffer is None or self._history_count == 0:
+        if self._history is None:
             raise RuntimeError("AttentionResidualMixer must be reset before use")
-        self._history_buffer[self._history_count].copy_(state)
-        self._history_count += 1
+        self._history.append(state)
 
     def _clear_state(self):
-        self._history_count = 0
+        self._history = None
 
 
 class BlockAttentionResidualMixer(_BaseAttentionResidualMixer):
@@ -138,72 +113,46 @@ class BlockAttentionResidualMixer(_BaseAttentionResidualMixer):
         if block_size <= 0:
             raise ValueError("block_size must be positive")
         self.block_size = block_size
-        self._max_completed_blocks = (num_steps + block_size - 1) // block_size
-        self._values_buffer = None
-        self._keys_buffer = None
-        self._has_state = False
-        self._num_completed_blocks = 0
+        self._initial_state = None
+        self._completed_blocks = None
+        self._current_block_sum = None
         self._current_block_count = 0
-        self._current_block_active = False
-
-    def _current_block_index(self) -> int:
-        return 1 + self._num_completed_blocks
-
-    def _num_sources(self) -> int:
-        return 1 + self._num_completed_blocks + int(self._current_block_active)
 
     def reset(self, initial_state: torch.Tensor):
-        num_sources = 1 + self._max_completed_blocks + 1
-        self._values_buffer = self._ensure_source_buffer(
-            self._values_buffer,
-            initial_state,
-            num_sources,
-        )
-        self._keys_buffer = self._ensure_source_buffer(
-            self._keys_buffer,
-            initial_state,
-            num_sources,
-        )
-        self._values_buffer[0].copy_(initial_state)
-        self._keys_buffer[0].copy_(self._rms_norm(initial_state))
-        self._has_state = True
-        self._num_completed_blocks = 0
+        self._initial_state = initial_state
+        self._completed_blocks = []
+        self._current_block_sum = None
         self._current_block_count = 0
-        self._current_block_active = False
+
+    def _value_sources(self):
+        if self._initial_state is None:
+            raise RuntimeError("BlockAttentionResidualMixer must be reset before use")
+        values = [self._initial_state]
+        values.extend(self._completed_blocks)
+        if self._current_block_sum is not None:
+            values.append(self._current_block_sum)
+        return values
 
     def prepare_input(self, step_idx: int) -> torch.Tensor:
-        if not self._has_state or self._values_buffer is None or self._keys_buffer is None:
-            raise RuntimeError("BlockAttentionResidualMixer must be reset before use")
-        num_sources = self._num_sources()
-        return self._aggregate_values(
-            step_idx,
-            self._values_buffer[:num_sources],
-            self._keys_buffer[:num_sources],
-        )
+        return self._aggregate_values(step_idx, self._value_sources())
 
     def record(self, state: torch.Tensor):
-        if not self._has_state or self._values_buffer is None or self._keys_buffer is None:
+        if self._initial_state is None:
             raise RuntimeError("BlockAttentionResidualMixer must be reset before use")
 
-        current_idx = self._current_block_index()
-        if not self._current_block_active:
-            self._values_buffer[current_idx].copy_(state)
-            self._current_block_active = True
+        if self._current_block_sum is None:
+            self._current_block_sum = state
         else:
-            self._values_buffer[current_idx].add_(state)
-
-        self._keys_buffer[current_idx].copy_(
-            self._rms_norm(self._values_buffer[current_idx])
-        )
+            self._current_block_sum = self._current_block_sum + state
 
         self._current_block_count += 1
         if self._current_block_count >= self.block_size:
-            self._num_completed_blocks += 1
+            self._completed_blocks.append(self._current_block_sum)
+            self._current_block_sum = None
             self._current_block_count = 0
-            self._current_block_active = False
 
     def _clear_state(self):
-        self._has_state = False
-        self._num_completed_blocks = 0
+        self._initial_state = None
+        self._completed_blocks = None
+        self._current_block_sum = None
         self._current_block_count = 0
-        self._current_block_active = False
