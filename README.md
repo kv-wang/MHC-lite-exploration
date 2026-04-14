@@ -44,6 +44,7 @@ To train a model, run `train.py`. Use `torchrun` to enable distributed training 
   * HC: `config/with_hc.py`
   * mHC: `config/with_mhc.py`
   * mHC-lite: `config/with_mhc_lite.py`
+  * mHC-lite Block-Depth: `config/with_mhc_lite_block_depth.py`
   * Attention Residuals: `config/with_attn_res.py`
   * Residual: (default)
 

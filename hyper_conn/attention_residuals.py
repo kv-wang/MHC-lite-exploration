@@ -3,6 +3,66 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class BlockDepthMemory:
+    """
+    Shared block-level depth memory for unified Block-Depth mHC variants.
+
+    This module only stores compressed depth history. It does not perform any
+    mixing by itself, so the actual readout stays inside the hyper-connection
+    operator.
+    """
+
+    def __init__(self, num_streams: int, block_size: int):
+        if num_streams <= 0:
+            raise ValueError("num_streams must be positive")
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
+        self.num_streams = num_streams
+        self.block_size = block_size
+        self.clear()
+
+    def _summarize(self, state: torch.Tensor) -> torch.Tensor:
+        if state.shape[0] % self.num_streams != 0:
+            raise RuntimeError("state batch dimension is not divisible by num_streams")
+        reshaped = state.reshape(state.shape[0] // self.num_streams, self.num_streams, *state.shape[1:])
+        return reshaped.mean(dim=1)
+
+    def reset(self, initial_state: torch.Tensor):
+        initial_summary = self._summarize(initial_state)
+        self.initial_state = initial_summary
+        self.completed_blocks = []
+        self.current_block_sum = None
+        self.current_block_count = 0
+
+    def get_sources(self):
+        if self.initial_state is None:
+            raise RuntimeError("BlockDepthMemory must be reset before use")
+        sources = [self.initial_state]
+        sources.extend(self.completed_blocks)
+        if self.current_block_sum is not None:
+            sources.append(self.current_block_sum)
+        return sources
+
+    def record(self, state: torch.Tensor):
+        summary = self._summarize(state)
+        if self.current_block_sum is None:
+            self.current_block_sum = summary
+        else:
+            self.current_block_sum = self.current_block_sum + summary
+        self.current_block_count += 1
+
+        if self.current_block_count >= self.block_size:
+            self.completed_blocks.append(self.current_block_sum)
+            self.current_block_sum = None
+            self.current_block_count = 0
+
+    def clear(self):
+        self.initial_state = None
+        self.completed_blocks = []
+        self.current_block_sum = None
+        self.current_block_count = 0
+
+
 class _BaseAttentionResidualMixer(nn.Module):
     def __init__(self, num_steps: int, dim: int):
         super().__init__()

@@ -41,6 +41,17 @@ def identity(t):
 def add(x, y):
     return x + y
 
+
+def first_tensor(tree):
+    if torch.is_tensor(tree):
+        return tree
+    flat, _ = tree_flatten(tree)
+    for item in flat:
+        if torch.is_tensor(item):
+            return item
+    raise RuntimeError("Expected at least one tensor in tree output")
+
+
 # sinkhorn
 
 def l1norm(t, dim):
@@ -208,17 +219,19 @@ class MHCLite(Module):
         mhc_identity_h_res = False,
         mhc_lite_method = "base",
         mhc_lite_perm_topk = 0,
+        block_depth_memory = None,
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
         """
         super().__init__()
-        valid_methods = {"base", "selective", "depth_attn", "block_attn"}
+        valid_methods = {"base", "selective", "depth_attn", "block_attn", "block_depth"}
         if mhc_lite_method not in valid_methods:
             raise ValueError(f"Invalid mhc_lite_method: {mhc_lite_method}")
         self.mhc_gate_fn = mhc_gate_fn
         self.mhc_identity_h_res = mhc_identity_h_res
         self.mhc_lite_method = mhc_lite_method
+        self.block_depth_memory = block_depth_memory
 
         self.branch = branch
 
@@ -271,25 +284,32 @@ class MHCLite(Module):
 
         init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
         init_alpha0[init_residual_index, :] = 1.
-        init_alpha1 = torch.ones(len(perms) * num_fracs) * -8
-        init_alpha1[0] = 0.
+        self.static_alpha_pre = nn.Parameter(init_alpha0.view(-1))
 
-        # (s*v + s!)
-        self.static_alpha = nn.Parameter(cat([
-            init_alpha0.view(-1) , 
-            init_alpha1
-        ], dim = -1))
-
-
-        self.dynamic_alpha_fn = nn.Parameter(
+        self.dynamic_alpha_pre_fn = nn.Parameter(
             torch.zeros(
-                dim * num_residual_streams, 
-                num_fracs * ( len(perms) + num_residual_streams * num_input_views )
+                dim * num_residual_streams,
+                num_fracs * (num_residual_streams * num_input_views)
             )
         )
 
+        if self.mhc_identity_h_res:
+            self.static_alpha_residual = None
+            self.dynamic_alpha_residual_fn = None
+            self.residual_scale = None
+        else:
+            init_alpha1 = torch.ones(len(perms) * num_fracs) * -8
+            init_alpha1[0] = 0.
+            self.static_alpha_residual = nn.Parameter(init_alpha1)
+            self.dynamic_alpha_residual_fn = nn.Parameter(
+                torch.zeros(
+                    dim * num_residual_streams,
+                    num_fracs * len(perms)
+                )
+            )
+            self.residual_scale = nn.Parameter(torch.ones(1) * 1e-2)
+
         self.pre_branch_scale = nn.Parameter(torch.ones(1) * 1e-2)
-        self.residual_scale = nn.Parameter(torch.ones(1) * 1e-2)
 
         # depth connection related (beta)
 
@@ -330,6 +350,46 @@ class MHCLite(Module):
 
         self.depth_residual_fn = depth_residual_fn
 
+        if self.mhc_lite_method == "block_depth":
+            if self.block_depth_memory is None:
+                raise ValueError("block_depth method requires a shared block_depth_memory")
+            self.depth_query_fn = nn.Parameter(torch.zeros(dim * num_residual_streams, dim * num_fracs))
+            self.depth_gate_fn = nn.Parameter(torch.zeros(dim * num_residual_streams, 1))
+            self.depth_gate_bias = nn.Parameter(torch.tensor(-2.0))
+
+    def _depth_source_scale(self, x: torch.Tensor) -> torch.Tensor:
+        norm = torch.linalg.vector_norm(x, dim=-1, keepdim=True)
+        return norm.clamp_min(1e-12).reciprocal() * (x.shape[-1] ** 0.5)
+
+    def _mix_block_depth_memory(self, branch_input, normed):
+        sources = self.block_depth_memory.get_sources()
+        if len(sources) == 0:
+            return branch_input
+
+        depth_context = normed
+        while depth_context.dim() > branch_input.dim():
+            depth_context = depth_context.mean(dim=-2)
+
+        query = depth_context @ self.depth_query_fn
+        attn_logits = []
+        for source in sources:
+            source_scale = self._depth_source_scale(source)
+            logit = (query * source).sum(dim=-1, keepdim=True)
+            logit = logit * source_scale.to(dtype=logit.dtype)
+            attn_logits.append(logit.float())
+
+        attn_logits = torch.cat(attn_logits, dim=-1)
+        attn = attn_logits.softmax(dim=-1)
+
+        mixed_memory = torch.zeros_like(branch_input)
+        for source_idx, source in enumerate(sources):
+            weight = attn[..., source_idx].to(dtype=branch_input.dtype).unsqueeze(-1)
+            mixed_memory = mixed_memory + source.to(dtype=branch_input.dtype) * weight
+
+        gate = torch.sigmoid((depth_context @ self.depth_gate_fn).squeeze(-1) + self.depth_gate_bias)
+        gate = gate.to(dtype=branch_input.dtype).unsqueeze(-1)
+        return branch_input + gate * (mixed_memory - branch_input)
+
     def width_connection(
         self,
         residuals
@@ -359,24 +419,24 @@ class MHCLite(Module):
         normed = self.norm(normed)
 
         # alpha for weighted sum of residuals going into branch
-        wc_weight = normed @ self.dynamic_alpha_fn # ... f (s*v + s!)
-        psize = self.num_input_views * streams
-        dynamic_pre, dynamic_residual = wc_weight[..., :psize], wc_weight[..., psize:]
-        static_pre  , static_residual   = self.static_alpha[:psize], self.static_alpha[psize:]
+        dynamic_pre = normed @ self.dynamic_alpha_pre_fn # ... f (s*v)
+        static_pre = self.static_alpha_pre
 
-        dev = str(wc_weight.device)
+        dev = str(dynamic_pre.device)
         if (streams, dev) not in perm_mats:
             _perm_mats = get_all_permutations(streams).to(dev)
             perm_mats[(streams, dev)] = _perm_mats
         perms = perm_mats[(streams, dev)]
         if self.mhc_identity_h_res:
             alpha_residual = torch.eye(
-                streams, device=dynamic_residual.device, dtype=dynamic_residual.dtype
+                streams, device=dynamic_pre.device, dtype=dynamic_pre.dtype
             )
             shape = list(dynamic_pre.shape[:-1]) + [streams, streams]
             alpha_residual = alpha_residual.expand(shape)
             alpha_residual = self.split_fracs(alpha_residual)
         else:
+            dynamic_residual = normed @ self.dynamic_alpha_residual_fn
+            static_residual = self.static_alpha_residual
             res_coeff = self.residual_scale * dynamic_residual + static_residual
             if self.mhc_lite_method == "selective":
                 topk = min(self.perm_topk, res_coeff.shape[-1])
@@ -430,6 +490,8 @@ class MHCLite(Module):
         # maybe merge fractions back
 
         branch_input = self.merge_fracs(branch_input)
+        if self.mhc_lite_method == "block_depth":
+            branch_input = self._mix_block_depth_memory(branch_input, normed)
         
         residuals = rearrange(residuals, 'b ... s d -> (b s) ... d')
         if self.channel_first:
@@ -513,8 +575,10 @@ class MHCLite(Module):
             return branch_input, add_residual_fn
 
         branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)
-
-        return add_residual_fn(branch_output)
+        output = add_residual_fn(branch_output)
+        if self.mhc_lite_method == "block_depth":
+            self.block_depth_memory.record(first_tensor(output))
+        return output
 
 MHCLite.get_expand_reduce_stream_functions = staticmethod(get_expand_reduce_stream_functions)
 MHCLite.get_init_and_expand_reduce_stream_functions = staticmethod(get_init_and_expand_reduce_stream_functions)

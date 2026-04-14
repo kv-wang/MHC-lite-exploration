@@ -44,7 +44,7 @@ hyper_conn_type = "none" # none, hc, mhc, mhc_lite, attn_res
 hyper_conn_n = 1 # num_streams
 mhc_gate_fn = "sigmoid"    # "softmax" or "sigmoid" for H_pre/H_post (mhc/mhc_lite only)
 mhc_identity_h_res = False # True = H_res fixed to I, no stream mixing (mhc/mhc_lite only)
-mhc_lite_method = "base"   # base, selective, depth_attn, block_attn
+mhc_lite_method = "base"   # base, selective, depth_attn, block_attn, block_depth
 mhc_lite_perm_topk = 0     # selective only; 0 defaults to num_streams
 mhc_lite_block_size = 4    # block_attn only; measured in sublayers
 # ----- hyper conn end -----
@@ -177,7 +177,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 if dataset == 'openwebtext':
-    data_dir = '/root/autodl-tmp/MHC/examples/nanogpt/data/openwebtext'
+    data_dir = '/root/autodl-tmp/nanoMoE-mhc/data/openwebtext'
 else:
     data_dir = os.path.join('data', dataset)
 

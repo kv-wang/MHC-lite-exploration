@@ -18,6 +18,7 @@ from hyper_conn import hyper_conn_init_func
 from hyper_conn.attention_residuals import (
     AttentionResidualMixer,
     BlockAttentionResidualMixer,
+    BlockDepthMemory,
 )
 
 class LayerNorm(nn.Module):
@@ -174,11 +175,18 @@ class GPT(nn.Module):
             mhc_gate_fn=config.mhc_gate_fn,
             mhc_identity_h_res=config.mhc_identity_h_res,
         )
+        block_depth_memory = None
         if config.hyper_conn_type == "mhc_lite":
             hc_kwargs.update(
                 mhc_lite_method=config.mhc_lite_method,
                 mhc_lite_perm_topk=config.mhc_lite_perm_topk,
             )
+            if config.mhc_lite_method == "block_depth":
+                block_depth_memory = BlockDepthMemory(
+                    num_streams=config.hyper_conn_n,
+                    block_size=config.mhc_lite_block_size,
+                )
+                hc_kwargs["block_depth_memory"] = block_depth_memory
 
         if config.hyper_conn_type == "attn_res":
             init_hc, expand_stream, reduce_stream = None, None, None
@@ -205,6 +213,7 @@ class GPT(nn.Module):
         self.expand_stream = expand_stream
         self.reduce_stream = reduce_stream
         self.attn_res_mixer = attn_res_mixer
+        self.block_depth_memory = block_depth_memory
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -273,10 +282,14 @@ class GPT(nn.Module):
             x = self.expand_stream(x)
         if self.attn_res_mixer is not None:
             self.attn_res_mixer.reset(x)
+        if self.block_depth_memory is not None:
+            self.block_depth_memory.reset(x)
         for block in self.transformer.h:
             x = block(x)
         if self.attn_res_mixer is not None:
             x = self.attn_res_mixer.finalize()
+        if self.block_depth_memory is not None:
+            self.block_depth_memory.clear()
         x = self.transformer.ln_f(x)
         if self.reduce_stream is not None:
             x = self.reduce_stream(x)

@@ -18,8 +18,9 @@ export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.bandw.top}"
 
 
 N_GPUS="${N_GPUS:-4}"
-MODEL_CONFIG="${MODEL_CONFIG:-config/xl_model.py}"
-WANDB_PROJECT="${WANDB_PROJECT:-mhc-lite-xl_owt}"
+TRAIN_CONFIG="${TRAIN_CONFIG:-config/train_owt.py}"
+MODEL_CONFIG="${MODEL_CONFIG:-config/large_model.py}"
+WANDB_PROJECT="${WANDB_PROJECT:-mhc-lite-large_owt}"
 
 run_one() {
   local name="$1"
@@ -31,14 +32,14 @@ run_one() {
 
   if [[ "$N_GPUS" -gt 0 ]]; then
     torchrun --standalone --nproc_per_node="$N_GPUS" train.py \
-      config/train_owt.py "$MODEL_CONFIG" \
+      "$TRAIN_CONFIG" "$MODEL_CONFIG" \
       --wandb_project="$WANDB_PROJECT" \
       --wandb_log_layer_stats=False \
       --wandb_log_layer_cosine=False \
       "$@"
   else
     python train.py \
-      config/train_owt.py "$MODEL_CONFIG" \
+      "$TRAIN_CONFIG" "$MODEL_CONFIG" \
       --wandb_project="$WANDB_PROJECT" \
       "$@"
   fi
@@ -49,7 +50,7 @@ run_one() {
 #
 # # 2) HC
 #run_one "HC" \
-#  config/with_hc.py
+  #config/with_hc.py
 #
 # # 3) mHC (sigmoid, default)
 #run_one "mHC-sigmoid" \
@@ -57,7 +58,7 @@ run_one() {
 #
 # # 4) mHC-lite (sigmoid, default)
 #run_one "mHC-lite-sigmoid" \
-#  config/with_mhc_lite.py
+  #config/with_mhc_lite.py
 #
 # # 5) Attention Residuals
 # run_one "AttnRes" \
@@ -86,9 +87,14 @@ run_one() {
 #run_one "mHC-lite-selective" \
   #config/with_mhc_lite_selective.py
 
+run_one "mHC-lite-block-attn" \
+  config/with_mhc_lite_block_attn.py \
+  --mhc_identity_h_res=True
 
 run_one "mHC-lite-block-attn" \
   config/with_mhc_lite_block_attn.py
+
+
 
 run_one "mHC-lite-depth-attn" \
   config/with_mhc_lite_depth_attn.py
