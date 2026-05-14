@@ -157,8 +157,15 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     hyper_conn_n: int = 1
     hyper_conn_type: str = "none"
+    hyper_conn_reduce_stream_mode: str = "sum"
     mhc_gate_fn: str = "sigmoid"
+    mhc_zero_init_pre_post_logits: bool = False
     mhc_identity_h_res: bool = False
+    mhc_h_res_mode: str = "sinkhorn"
+    mhc_admm_iters: int = 20
+    mhc_admm_rho: float = 1.0
+    mhc_lite_h_res_mode: str = "doubly_stochastic"
+    mhc_lite_ns_steps: int = 5
     mhc_lite_method: str = "base"
     mhc_lite_perm_topk: int = 0
     mhc_lite_block_size: int = 4
@@ -176,8 +183,21 @@ class GPT(nn.Module):
             mhc_identity_h_res=config.mhc_identity_h_res,
         )
         block_depth_memory = None
+        if config.hyper_conn_type == "mhc":
+            hc_kwargs.update(
+                mhc_zero_init_pre_post_logits=config.mhc_zero_init_pre_post_logits,
+                mhc_h_res_mode=config.mhc_h_res_mode,
+                mhc_admm_iters=config.mhc_admm_iters,
+                mhc_admm_rho=config.mhc_admm_rho,
+            )
+        if config.hyper_conn_type == "analysis":
+            hc_kwargs.update(
+                mhc_zero_init_pre_post_logits=config.mhc_zero_init_pre_post_logits,
+            )
         if config.hyper_conn_type == "mhc_lite":
             hc_kwargs.update(
+                mhc_lite_h_res_mode=config.mhc_lite_h_res_mode,
+                mhc_lite_ns_steps=config.mhc_lite_ns_steps,
                 mhc_lite_method=config.mhc_lite_method,
                 mhc_lite_perm_topk=config.mhc_lite_perm_topk,
             )
@@ -195,6 +215,7 @@ class GPT(nn.Module):
             init_hc, expand_stream, reduce_stream = hyper_conn_init_func(
                 config.hyper_conn_type,
                 config.hyper_conn_n,
+                reduce_stream_mode=config.hyper_conn_reduce_stream_mode,
                 **hc_kwargs,
             )
             if config.hyper_conn_type == "mhc_lite" and config.mhc_lite_method == "depth_attn":

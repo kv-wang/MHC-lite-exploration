@@ -58,6 +58,23 @@ def l1norm(t, dim):
     return F.normalize(t, p = 1, dim = dim)
 
 
+def zeropower_via_newtonschulz5(g: torch.Tensor, steps: int, eps: float = 1e-7) -> torch.Tensor:
+    assert g.ndim >= 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    x = g.clone()
+    transposed = x.size(-2) > x.size(-1)
+    if transposed:
+        x = x.mT
+    x = x / (x.norm(dim = (-2, -1), keepdim = True) + eps)
+    for _ in range(steps):
+        a_mat = x @ x.mT
+        b_mat = b * a_mat + c * a_mat @ a_mat
+        x = a * x + b_mat @ x
+    if transposed:
+        x = x.mT
+    return x
+
+
 def get_all_permutations(n: int):
     """
     生成所有 n × n 的排列矩阵，并按 (n!, n, n) 的形状返回
@@ -79,10 +96,14 @@ def get_expand_reduce_stream_functions(
     num_streams,
     add_stream_embed = False,
     dim = None,
-    disable = False
+    disable = False,
+    reduce_stream_mode = "sum",
 ):
     if num_streams == 1 or disable:
         return (nn.Identity(), nn.Identity())
+
+    if reduce_stream_mode not in {"sum", "mean"}:
+        raise ValueError(f"Invalid reduce_stream_mode: {reduce_stream_mode}")
 
     if add_stream_embed:
         assert exists(dim), '`dim` must be passed into get_init_and_expand_reduce_stream_functions for returning an expansion function with stream embeddings added'
@@ -91,7 +112,7 @@ def get_expand_reduce_stream_functions(
     else:
         expand_fn = Reduce(pattern = 'b ... -> (b s) ...', reduction = 'repeat', s = num_streams)
 
-    reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = 'sum', s = num_streams)
+    reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = reduce_stream_mode, s = num_streams)
 
     return expand_fn, reduce_fn
 
@@ -101,6 +122,7 @@ def get_init_and_expand_reduce_stream_functions(
     dim = None,
     add_stream_embed = False,
     disable = None,
+    reduce_stream_mode = "sum",
     **kwargs
 ):
     disable = default(disable, num_streams == 1 and num_fracs == 1)
@@ -108,7 +130,13 @@ def get_init_and_expand_reduce_stream_functions(
     hyper_conn_klass = MHCLite if not disable else Residual
 
     init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, num_fracs = num_fracs, **kwargs)
-    expand_reduce_fns = get_expand_reduce_stream_functions(num_streams, add_stream_embed = add_stream_embed, dim = dim, disable = disable)
+    expand_reduce_fns = get_expand_reduce_stream_functions(
+        num_streams,
+        add_stream_embed = add_stream_embed,
+        dim = dim,
+        disable = disable,
+        reduce_stream_mode = reduce_stream_mode,
+    )
 
     if exists(dim):
         init_hyper_conn_fn = partial(init_hyper_conn_fn, dim = dim)
@@ -217,6 +245,8 @@ class MHCLite(Module):
         num_fracs = 1,                      # https://arxiv.org/abs/2503.14125
         mhc_gate_fn = "sigmoid",
         mhc_identity_h_res = False,
+        mhc_lite_h_res_mode = "doubly_stochastic",
+        mhc_lite_ns_steps = 5,
         mhc_lite_method = "base",
         mhc_lite_perm_topk = 0,
         block_depth_memory = None,
@@ -228,8 +258,17 @@ class MHCLite(Module):
         valid_methods = {"base", "selective", "depth_attn", "block_attn", "block_depth"}
         if mhc_lite_method not in valid_methods:
             raise ValueError(f"Invalid mhc_lite_method: {mhc_lite_method}")
+        valid_h_res_modes = {"doubly_stochastic", "newton_schulz"}
+        if mhc_lite_h_res_mode not in valid_h_res_modes:
+            raise ValueError(f"Invalid mhc_lite_h_res_mode: {mhc_lite_h_res_mode}")
+        if mhc_lite_ns_steps < 1:
+            raise ValueError("mhc_lite_ns_steps must be >= 1")
+        if mhc_lite_method == "selective" and mhc_lite_h_res_mode != "doubly_stochastic":
+            raise ValueError("mhc_lite_method='selective' requires mhc_lite_h_res_mode='doubly_stochastic'")
         self.mhc_gate_fn = mhc_gate_fn
         self.mhc_identity_h_res = mhc_identity_h_res
+        self.mhc_lite_h_res_mode = mhc_lite_h_res_mode
+        self.mhc_lite_ns_steps = mhc_lite_ns_steps
         self.mhc_lite_method = mhc_lite_method
         self.block_depth_memory = block_depth_memory
 
@@ -277,10 +316,13 @@ class MHCLite(Module):
         # XXX MHC Lite impl. 
         # H_res is from nC to n!
         # ------
-        if (num_residual_streams, "cpu") not in perm_mats:
-            _perm_mats = get_all_permutations(num_residual_streams).to("cpu")
-            perm_mats[(num_residual_streams, "cpu")] = _perm_mats
-        perms = perm_mats[(num_residual_streams, "cpu")]
+        if self.mhc_lite_h_res_mode == "doubly_stochastic":
+            if (num_residual_streams, "cpu") not in perm_mats:
+                _perm_mats = get_all_permutations(num_residual_streams).to("cpu")
+                perm_mats[(num_residual_streams, "cpu")] = _perm_mats
+            perms = perm_mats[(num_residual_streams, "cpu")]
+        else:
+            perms = None
 
         init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
         init_alpha0[init_residual_index, :] = 1.
@@ -298,15 +340,22 @@ class MHCLite(Module):
             self.dynamic_alpha_residual_fn = None
             self.residual_scale = None
         else:
-            init_alpha1 = torch.ones(len(perms) * num_fracs) * -8
-            init_alpha1[0] = 0.
-            self.static_alpha_residual = nn.Parameter(init_alpha1)
-            self.dynamic_alpha_residual_fn = nn.Parameter(
-                torch.zeros(
+            if self.mhc_lite_h_res_mode == "doubly_stochastic":
+                init_alpha1 = torch.ones(len(perms) * num_fracs) * -8
+                init_alpha1[0] = 0.
+                dynamic_alpha_residual_shape = (
                     dim * num_residual_streams,
                     num_fracs * len(perms)
                 )
-            )
+            else:
+                init_alpha1 = torch.eye(num_residual_streams, dtype = torch.float32)
+                init_alpha1 = repeat(init_alpha1, 'i j -> i (f j)', f = num_fracs)
+                dynamic_alpha_residual_shape = (
+                    dim * num_residual_streams,
+                    num_fracs * num_residual_streams * num_residual_streams
+                )
+            self.static_alpha_residual = nn.Parameter(init_alpha1.reshape(-1))
+            self.dynamic_alpha_residual_fn = nn.Parameter(torch.zeros(dynamic_alpha_residual_shape))
             self.residual_scale = nn.Parameter(torch.ones(1) * 1e-2)
 
         self.pre_branch_scale = nn.Parameter(torch.ones(1) * 1e-2)
@@ -422,11 +471,6 @@ class MHCLite(Module):
         dynamic_pre = normed @ self.dynamic_alpha_pre_fn # ... f (s*v)
         static_pre = self.static_alpha_pre
 
-        dev = str(dynamic_pre.device)
-        if (streams, dev) not in perm_mats:
-            _perm_mats = get_all_permutations(streams).to(dev)
-            perm_mats[(streams, dev)] = _perm_mats
-        perms = perm_mats[(streams, dev)]
         if self.mhc_identity_h_res:
             alpha_residual = torch.eye(
                 streams, device=dynamic_pre.device, dtype=dynamic_pre.dtype
@@ -438,14 +482,31 @@ class MHCLite(Module):
             dynamic_residual = normed @ self.dynamic_alpha_residual_fn
             static_residual = self.static_alpha_residual
             res_coeff = self.residual_scale * dynamic_residual + static_residual
-            if self.mhc_lite_method == "selective":
-                topk = min(self.perm_topk, res_coeff.shape[-1])
-                if topk < res_coeff.shape[-1]:
-                    topk_vals, topk_idx = torch.topk(res_coeff, k=topk, dim=-1)
-                    masked = torch.full_like(res_coeff, float("-inf"))
-                    res_coeff = masked.scatter(-1, topk_idx, topk_vals)
-            res_coeff = torch.softmax(res_coeff, dim = -1)
-            alpha_residual = einsum(res_coeff, perms, '... r, r i j-> ... i j')
+            if self.mhc_lite_h_res_mode == "doubly_stochastic":
+                dev = str(dynamic_pre.device)
+                if (streams, dev) not in perm_mats:
+                    _perm_mats = get_all_permutations(streams).to(dev)
+                    perm_mats[(streams, dev)] = _perm_mats
+                perms = perm_mats[(streams, dev)]
+                if self.mhc_lite_method == "selective":
+                    topk = min(self.perm_topk, res_coeff.shape[-1])
+                    if topk < res_coeff.shape[-1]:
+                        topk_vals, topk_idx = torch.topk(res_coeff, k=topk, dim=-1)
+                        masked = torch.full_like(res_coeff, float("-inf"))
+                        res_coeff = masked.scatter(-1, topk_idx, topk_vals)
+                res_coeff = torch.softmax(res_coeff, dim = -1)
+                alpha_residual = einsum(res_coeff, perms, '... r, r i j-> ... i j')
+            else:
+                res_coeff = rearrange(
+                    res_coeff,
+                    '... (i j) -> ... i j',
+                    i = streams,
+                    j = self.num_fracs * streams
+                )
+                alpha_residual = zeropower_via_newtonschulz5(
+                    res_coeff,
+                    steps = self.mhc_lite_ns_steps
+                )
             alpha_residual = self.split_fracs(alpha_residual)
 
         alpha_pre = self.pre_branch_scale * dynamic_pre + static_pre

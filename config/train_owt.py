@@ -9,7 +9,7 @@ out_prefix_dataset = "owt"
 
 dataset = 'openwebtext'
 gradient_accumulation_steps = 128
-batch_size = 1
+batch_size = 2
 block_size = 1024
 
 dtype = 'bfloat16'

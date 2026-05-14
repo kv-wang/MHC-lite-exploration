@@ -64,16 +64,65 @@ def sinkhorn_knopps(log_alpha, iters=20):
 
     return log_alpha.exp()
 
+def project_simplex(x, dim=-1):
+    dim = dim if dim >= 0 else x.ndim + dim
+    x = x.movedim(dim, -1)
+    shape = x.shape
+    x_flat = x.reshape(-1, shape[-1])
+
+    sorted_x, _ = torch.sort(x_flat, dim=-1, descending=True)
+    cssv = sorted_x.cumsum(dim=-1) - 1
+    ind = torch.arange(1, shape[-1] + 1, device=x.device, dtype=x.dtype)
+    support = sorted_x - cssv / ind > 0
+    rho = support.sum(dim=-1, keepdim=True).clamp_min(1)
+    theta = cssv.gather(-1, rho - 1) / rho.to(dtype=x.dtype)
+
+    projected = (x_flat - theta).clamp_min(0)
+    return projected.reshape(shape).movedim(-1, dim)
+
+def project_rows(x):
+    return project_simplex(x, dim=-1)
+
+def project_cols(x):
+    return project_simplex(x.mT, dim=-1).mT
+
+def admm_doubly_stochastic(log_alpha, iters=20, rho=1.):
+    a = torch.softmax(log_alpha, dim=-1)
+    x1 = project_rows(a)
+    x2 = project_cols(a)
+    u = torch.zeros_like(a)
+
+    for _ in range(iters):
+        x1 = project_rows((a + rho * (x2 - u)) / (1. + rho))
+        x2 = project_cols(x1 + u)
+        u = u + x1 - x2
+
+    return 0.5 * (x1 + x2)
+
+def cayley_orthogonalize(matrix):
+    orig_dtype = matrix.dtype
+    work_dtype = torch.float32 if orig_dtype in (torch.float16, torch.bfloat16) else orig_dtype
+    matrix = matrix.to(work_dtype)
+    skew = 0.5 * (matrix - matrix.transpose(-2, -1))
+    eye = torch.eye(skew.shape[-1], device=skew.device, dtype=work_dtype)
+    eye = eye.expand(skew.shape)
+    orth = torch.linalg.solve(eye - skew, eye + skew)
+    return orth.to(orig_dtype)
+
 # main functions
 
 def get_expand_reduce_stream_functions(
     num_streams,
     add_stream_embed = False,
     dim = None,
-    disable = False
+    disable = False,
+    reduce_stream_mode = "sum",
 ):
     if num_streams == 1 or disable:
         return (nn.Identity(), nn.Identity())
+
+    if reduce_stream_mode not in {"sum", "mean"}:
+        raise ValueError(f"Invalid reduce_stream_mode: {reduce_stream_mode}")
 
     if add_stream_embed:
         assert exists(dim), '`dim` must be passed into get_init_and_expand_reduce_stream_functions for returning an expansion function with stream embeddings added'
@@ -82,7 +131,7 @@ def get_expand_reduce_stream_functions(
     else:
         expand_fn = Reduce(pattern = 'b ... -> (b s) ...', reduction = 'repeat', s = num_streams)
 
-    reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = 'sum', s = num_streams)
+    reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = reduce_stream_mode, s = num_streams)
 
     return expand_fn, reduce_fn
 
@@ -93,6 +142,7 @@ def get_init_and_expand_reduce_stream_functions(
     add_stream_embed = False,
     disable = None,
     sinkhorn_iters = 20,
+    reduce_stream_mode = "sum",
     **kwargs
 ):
     disable = default(disable, num_streams == 1 and num_fracs == 1)
@@ -100,7 +150,13 @@ def get_init_and_expand_reduce_stream_functions(
     hyper_conn_klass = ManifoldConstrainedHyperConnections if not disable else Residual
 
     init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, num_fracs = num_fracs, sinkhorn_iters = sinkhorn_iters, **kwargs)
-    expand_reduce_fns = get_expand_reduce_stream_functions(num_streams, add_stream_embed = add_stream_embed, dim = dim, disable = disable)
+    expand_reduce_fns = get_expand_reduce_stream_functions(
+        num_streams,
+        add_stream_embed = add_stream_embed,
+        dim = dim,
+        disable = disable,
+        reduce_stream_mode = reduce_stream_mode,
+    )
 
     if exists(dim):
         init_hyper_conn_fn = partial(init_hyper_conn_fn, dim = dim)
@@ -207,12 +263,23 @@ class ManifoldConstrainedHyperConnections(Module):
         num_fracs = 1,                      # https://arxiv.org/abs/2503.14125
         sinkhorn_iters = 20,
         mhc_gate_fn = "sigmoid",
+        mhc_zero_init_pre_post_logits = False,
         mhc_identity_h_res = False,
+        mhc_h_res_mode = "sinkhorn",
+        mhc_admm_iters = 20,
+        mhc_admm_rho = 1.,
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
         """
         super().__init__()
+        valid_h_res_modes = {"sinkhorn", "admm", "cayley"}
+        if mhc_h_res_mode not in valid_h_res_modes:
+            raise ValueError(f"Invalid mhc_h_res_mode: {mhc_h_res_mode}")
+        if mhc_admm_iters < 1:
+            raise ValueError("mhc_admm_iters must be >= 1")
+        if mhc_admm_rho <= 0:
+            raise ValueError("mhc_admm_rho must be > 0")
 
         self.branch = branch
 
@@ -253,8 +320,11 @@ class ManifoldConstrainedHyperConnections(Module):
 
         self.norm = RMSNorm(dim * num_residual_streams_fracs)
 
-        init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
-        init_alpha0[init_residual_index, :] = 1.
+        if mhc_zero_init_pre_post_logits:
+            init_alpha0 = torch.zeros((num_residual_streams_fracs, num_input_views_fracs))
+        else:
+            init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
+            init_alpha0[init_residual_index, :] = 1.
         init_alpha1 = torch.ones((num_residual_streams_fracs, num_residual_streams_fracs)) * -8
         init_alpha1.fill_diagonal_(0.)
         self.static_alpha = nn.Parameter(cat((init_alpha0, init_alpha1), dim = 1))
@@ -278,8 +348,11 @@ class ManifoldConstrainedHyperConnections(Module):
         self.add_branch_out_to_residual = add_branch_out_to_residual
 
         if add_branch_out_to_residual:
-            beta_init = torch.ones(num_residual_streams_fracs) * -1.
-            beta_init[init_residual_index] = 1.
+            if mhc_zero_init_pre_post_logits:
+                beta_init = torch.zeros(num_residual_streams_fracs)
+            else:
+                beta_init = torch.ones(num_residual_streams_fracs) * -1.
+                beta_init[init_residual_index] = 1.
             self.static_beta = nn.Parameter(beta_init)
 
             # ------ 
@@ -298,7 +371,11 @@ class ManifoldConstrainedHyperConnections(Module):
 
         self.sinkhorn_iters = sinkhorn_iters
         self.mhc_gate_fn = mhc_gate_fn
+        self.mhc_zero_init_pre_post_logits = mhc_zero_init_pre_post_logits
         self.mhc_identity_h_res = mhc_identity_h_res
+        self.mhc_h_res_mode = mhc_h_res_mode
+        self.mhc_admm_iters = mhc_admm_iters
+        self.mhc_admm_rho = mhc_admm_rho
 
         # dropouts
 
@@ -368,20 +445,58 @@ class ManifoldConstrainedHyperConnections(Module):
         alpha_pre, alpha_residual = alpha[..., :self.num_input_views], alpha[..., self.num_input_views:]
 
         if self.mhc_gate_fn == "softmax":
-            alpha_pre = F.softmax(alpha_pre, dim=-1)
+            # Normalize across residual streams, matching H_post's stream-wise routing.
+            alpha_pre = F.softmax(alpha_pre, dim=-3)
         else:
             alpha_pre = alpha_pre.sigmoid()
 
         if self.mhc_identity_h_res:
             streams = self.num_residual_streams
+            target_shape = alpha_residual.shape
             alpha_residual = torch.eye(
-                streams, device=alpha_residual.device, dtype=alpha_residual.dtype
-            ).expand_as(alpha_residual[..., :streams, :streams])
-            alpha_residual = self.split_fracs(alpha_residual)
+                self.num_fracs * streams,
+                device=alpha_residual.device,
+                dtype=alpha_residual.dtype,
+            )
+            alpha_residual = rearrange(
+                alpha_residual,
+                '(f1 s1) (f2 s2) -> f1 s1 f2 s2',
+                f1=self.num_fracs,
+                s1=streams,
+                f2=self.num_fracs,
+                s2=streams,
+            )
+            alpha_residual = alpha_residual.expand(target_shape)
         else:
-            alpha_residual = rearrange(alpha_residual, '... f s g t -> ... f g s t')
-            alpha_residual = sinkhorn_knopps(alpha_residual, self.sinkhorn_iters)
-            alpha_residual = rearrange(alpha_residual, '... f g s t -> ... f s g t')
+            if self.mhc_h_res_mode == "cayley":
+                alpha_residual = rearrange(
+                    alpha_residual,
+                    '... f1 s1 f2 s2 -> ... (f1 s1) (f2 s2)',
+                    f1=self.num_fracs,
+                    s1=streams,
+                    f2=self.num_fracs,
+                    s2=streams,
+                )
+                alpha_residual = cayley_orthogonalize(alpha_residual)
+                alpha_residual = rearrange(
+                    alpha_residual,
+                    '... (f1 s1) (f2 s2) -> ... f1 s1 f2 s2',
+                    f1=self.num_fracs,
+                    s1=streams,
+                    f2=self.num_fracs,
+                    s2=streams,
+                )
+            else:
+                alpha_residual = rearrange(alpha_residual, '... f s g t -> ... f g s t')
+                if self.mhc_h_res_mode == "sinkhorn":
+                    alpha_residual = sinkhorn_knopps(alpha_residual, self.sinkhorn_iters)
+                else:
+                    alpha_residual = admm_doubly_stochastic(
+                        alpha_residual,
+                        iters=self.mhc_admm_iters,
+                        rho=self.mhc_admm_rho,
+                    )
+                alpha_residual = rearrange(alpha_residual, '... f g s t -> ... f s g t')
 
         alpha = cat((alpha_pre, alpha_residual), dim = -1) # (..., f, s, f, s+v)
 

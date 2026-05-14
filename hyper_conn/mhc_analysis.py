@@ -62,10 +62,14 @@ def get_expand_reduce_stream_functions(
     num_streams,
     add_stream_embed = False,
     dim = None,
-    disable = False
+    disable = False,
+    reduce_stream_mode = "sum",
 ):
     if num_streams == 1 or disable:
         return (nn.Identity(), nn.Identity())
+
+    if reduce_stream_mode not in {"sum", "mean"}:
+        raise ValueError(f"Invalid reduce_stream_mode: {reduce_stream_mode}")
 
     if add_stream_embed:
         assert exists(dim), '`dim` must be passed into get_init_and_expand_reduce_stream_functions for returning an expansion function with stream embeddings added'
@@ -74,7 +78,7 @@ def get_expand_reduce_stream_functions(
     else:
         expand_fn = Reduce(pattern = 'b ... -> (b s) ...', reduction = 'repeat', s = num_streams)
 
-    reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = 'sum', s = num_streams)
+    reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = reduce_stream_mode, s = num_streams)
 
     return expand_fn, reduce_fn
 
@@ -85,6 +89,7 @@ def get_init_and_expand_reduce_stream_functions(
     add_stream_embed = False,
     disable = None,
     sinkhorn_iters = 20,
+    reduce_stream_mode = "sum",
     **kwargs
 ):
     disable = default(disable, num_streams == 1 and num_fracs == 1)
@@ -92,7 +97,13 @@ def get_init_and_expand_reduce_stream_functions(
     hyper_conn_klass = MHCAnalysis if not disable else Residual
 
     init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, num_fracs = num_fracs, sinkhorn_iters = sinkhorn_iters, **kwargs)
-    expand_reduce_fns = get_expand_reduce_stream_functions(num_streams, add_stream_embed = add_stream_embed, dim = dim, disable = disable)
+    expand_reduce_fns = get_expand_reduce_stream_functions(
+        num_streams,
+        add_stream_embed = add_stream_embed,
+        dim = dim,
+        disable = disable,
+        reduce_stream_mode = reduce_stream_mode,
+    )
 
     if exists(dim):
         init_hyper_conn_fn = partial(init_hyper_conn_fn, dim = dim)
@@ -197,7 +208,10 @@ class MHCAnalysis(Module):
         num_input_views = 1,                # allow for the branch module to receive multiple input views, dimension placed on the very left (before batch)
         depth_residual_fn = add,
         num_fracs = 1,                      # https://arxiv.org/abs/2503.14125
-        sinkhorn_iters = 20
+        sinkhorn_iters = 20,
+        mhc_gate_fn = "sigmoid",
+        mhc_zero_init_pre_post_logits = False,
+        mhc_identity_h_res = False,
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
@@ -243,8 +257,11 @@ class MHCAnalysis(Module):
 
         self.norm = RMSNorm(dim * num_residual_streams_fracs)
 
-        init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
-        init_alpha0[init_residual_index, :] = 1.
+        if mhc_zero_init_pre_post_logits:
+            init_alpha0 = torch.zeros((num_residual_streams_fracs, num_input_views_fracs))
+        else:
+            init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
+            init_alpha0[init_residual_index, :] = 1.
         init_alpha1 = torch.ones((num_residual_streams_fracs, num_residual_streams_fracs)) * -8
         init_alpha1.fill_diagonal_(0.)
         self.static_alpha = nn.Parameter(cat((init_alpha0, init_alpha1), dim = 1))
@@ -268,8 +285,11 @@ class MHCAnalysis(Module):
         self.add_branch_out_to_residual = add_branch_out_to_residual
 
         if add_branch_out_to_residual:
-            beta_init = torch.ones(num_residual_streams_fracs) * -1.
-            beta_init[init_residual_index] = 1.
+            if mhc_zero_init_pre_post_logits:
+                beta_init = torch.zeros(num_residual_streams_fracs)
+            else:
+                beta_init = torch.ones(num_residual_streams_fracs) * -1.
+                beta_init[init_residual_index] = 1.
             self.static_beta = nn.Parameter(beta_init)
 
             # ------ 

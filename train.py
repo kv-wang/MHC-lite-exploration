@@ -42,8 +42,15 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # ----- hyper conn start -----
 hyper_conn_type = "none" # none, hc, mhc, mhc_lite, attn_res
 hyper_conn_n = 1 # num_streams
+hyper_conn_reduce_stream_mode = "sum" # "sum" or "mean" for final multi-stream reduction
 mhc_gate_fn = "sigmoid"    # "softmax" or "sigmoid" for H_pre/H_post (mhc/mhc_lite only)
+mhc_zero_init_pre_post_logits = False # True = initialize H_pre/H_post static logits to all zeros (mhc only)
 mhc_identity_h_res = False # True = H_res fixed to I, no stream mixing (mhc/mhc_lite only)
+mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", or "cayley" for H_res (mhc only)
+mhc_admm_iters = 20        # ADMM steps for H_res when mhc_h_res_mode="admm"
+mhc_admm_rho = 1.0         # ADMM penalty for H_res when mhc_h_res_mode="admm"
+mhc_lite_h_res_mode = "doubly_stochastic" # "doubly_stochastic" or "newton_schulz" for H_res (mhc_lite only)
+mhc_lite_ns_steps = 5      # Newton-Schulz steps for H_res when mhc_lite_h_res_mode="newton_schulz"
 mhc_lite_method = "base"   # base, selective, depth_attn, block_attn, block_depth
 mhc_lite_perm_topk = 0     # selective only; 0 defaults to num_streams
 mhc_lite_block_size = 4    # block_attn only; measured in sublayers
@@ -115,6 +122,10 @@ if wandb_run_name == 'exp':
         if hyper_conn_type == "mhc_lite" and mhc_lite_method != "base":
             tag += f"-{mhc_lite_method.replace('_', '-')}"
         tag += f"-{mhc_gate_fn}"
+        if hyper_conn_type == "mhc" and mhc_h_res_mode != "sinkhorn":
+            tag += f"-{mhc_h_res_mode.replace('_', '-')}"
+        if hyper_conn_type == "mhc_lite" and mhc_lite_h_res_mode != "doubly_stochastic":
+            tag += f"-{mhc_lite_h_res_mode.replace('_', '-')}"
         if mhc_identity_h_res:
             tag += "-idH"
         wandb_run_name = tag
@@ -229,8 +240,15 @@ model_args = dict(
     dropout=dropout,
     hyper_conn_n=hyper_conn_n,
     hyper_conn_type=hyper_conn_type,
+    hyper_conn_reduce_stream_mode=hyper_conn_reduce_stream_mode,
     mhc_gate_fn=mhc_gate_fn,
+    mhc_zero_init_pre_post_logits=mhc_zero_init_pre_post_logits,
     mhc_identity_h_res=mhc_identity_h_res,
+    mhc_h_res_mode=mhc_h_res_mode,
+    mhc_admm_iters=mhc_admm_iters,
+    mhc_admm_rho=mhc_admm_rho,
+    mhc_lite_h_res_mode=mhc_lite_h_res_mode,
+    mhc_lite_ns_steps=mhc_lite_ns_steps,
     mhc_lite_method=mhc_lite_method,
     mhc_lite_perm_topk=mhc_lite_perm_topk,
     mhc_lite_block_size=mhc_lite_block_size,

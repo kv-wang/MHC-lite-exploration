@@ -21,6 +21,7 @@ N_GPUS="${N_GPUS:-4}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-config/train_owt.py}"
 MODEL_CONFIG="${MODEL_CONFIG:-config/large_model.py}"
 WANDB_PROJECT="${WANDB_PROJECT:-mhc-lite-large_owt}"
+NUM_STREAMS="${NUM_STREAMS:-}"
 
 run_one() {
   local name="$1"
@@ -36,11 +37,13 @@ run_one() {
       --wandb_project="$WANDB_PROJECT" \
       --wandb_log_layer_stats=False \
       --wandb_log_layer_cosine=False \
+      ${NUM_STREAMS:+--num_streams="$NUM_STREAMS"} \
       "$@"
   else
     python train.py \
       "$TRAIN_CONFIG" "$MODEL_CONFIG" \
       --wandb_project="$WANDB_PROJECT" \
+      ${NUM_STREAMS:+--num_streams="$NUM_STREAMS"} \
       "$@"
   fi
 }
@@ -87,17 +90,18 @@ run_one() {
 #run_one "mHC-lite-selective" \
   #config/with_mhc_lite_selective.py
 
-run_one "mHC-lite-block-attn" \
-  config/with_mhc_lite_block_attn.py \
-  --mhc_identity_h_res=True
+#run_one "mHC-lite-block-attn" \
+  #config/with_mhc_lite_block_attn.py \
+  #--mhc_identity_h_res=True
 
-run_one "mHC-lite-block-attn" \
-  config/with_mhc_lite_block_attn.py
+#run_one "mHC-lite-block-attn" \
+  #config/with_mhc_lite_block_attn.py
 
+#run_one "mHC-lite-depth-attn" \
+  #config/with_mhc_lite_depth_attn.py
 
-
-run_one "mHC-lite-depth-attn" \
-  config/with_mhc_lite_depth_attn.py
+run_one "mHC-lite-block-depth" \
+  config/with_mhc_lite_block_depth.py
 
 echo ""
 echo "================================================================"

@@ -46,10 +46,14 @@ def get_expand_reduce_stream_functions(
     num_streams,
     add_stream_embed = False,
     dim = None,
-    disable = False
+    disable = False,
+    reduce_stream_mode = "sum",
 ):
     if num_streams == 1 or disable:
         return (nn.Identity(), nn.Identity())
+
+    if reduce_stream_mode not in {"sum", "mean"}:
+        raise ValueError(f"Invalid reduce_stream_mode: {reduce_stream_mode}")
 
     if add_stream_embed:
         assert exists(dim), '`dim` must be passed into get_init_and_expand_reduce_stream_functions for returning an expansion function with stream embeddings added'
@@ -58,7 +62,7 @@ def get_expand_reduce_stream_functions(
     else:
         expand_fn = Reduce(pattern = 'b ... -> (b s) ...', reduction = 'repeat', s = num_streams)
 
-    reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = 'sum', s = num_streams)
+    reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = reduce_stream_mode, s = num_streams)
 
     return expand_fn, reduce_fn
 
@@ -67,14 +71,21 @@ def get_init_and_expand_reduce_stream_functions(
     num_fracs = 1,
     dim = None,
     add_stream_embed = False,
-    disable = None
+    disable = None,
+    reduce_stream_mode = "sum",
 ):
     disable = default(disable, num_streams == 1 and num_fracs == 1)
 
     hyper_conn_klass = HyperConnections if not disable else Residual
 
     init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, num_fracs = num_fracs)
-    expand_reduce_fns = get_expand_reduce_stream_functions(num_streams, add_stream_embed = add_stream_embed, dim = dim, disable = disable)
+    expand_reduce_fns = get_expand_reduce_stream_functions(
+        num_streams,
+        add_stream_embed = add_stream_embed,
+        dim = dim,
+        disable = disable,
+        reduce_stream_mode = reduce_stream_mode,
+    )
 
     if exists(dim):
         init_hyper_conn_fn = partial(init_hyper_conn_fn, dim = dim)

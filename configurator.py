@@ -17,6 +17,10 @@ comes up with a better simple Python solution I am all ears.
 import sys
 from ast import literal_eval
 
+ALIASES = {
+    "num_streams": "hyper_conn_n",
+}
+
 for arg in sys.argv[1:]:
     if '=' not in arg:
         # assume it's the name of a config file
@@ -31,6 +35,7 @@ for arg in sys.argv[1:]:
         assert arg.startswith('--')
         key, val = arg.split('=')
         key = key[2:]
+        key = ALIASES.get(key, key)
         if key in globals():
             try:
                 # attempt to eval it it (e.g. if bool, number, or etc)

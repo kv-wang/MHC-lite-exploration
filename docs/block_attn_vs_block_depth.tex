@@ -1,0 +1,227 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
+\usepackage{hyperref}
+
+\title{Block Attention vs. Block-Depth mHC}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Setup}
+
+We compare two methods implemented in the codebase:
+\begin{itemize}
+    \item \texttt{mhc\_lite\_method = block\_attn}
+    \item \texttt{mhc\_lite\_method = block\_depth}
+\end{itemize}
+
+Let the input to the $t$-th sublayer be denoted by $x_t$.
+Let the block-level depth memory sources be
+\begin{equation}
+    \mathcal{S}_t = \{s_0, s_1, \dots, s_m\},
+\end{equation}
+where these sources typically include:
+\begin{itemize}
+    \item the initial state,
+    \item completed block summaries,
+    \item the current block partial sum.
+\end{itemize}
+
+Each source satisfies $s_i \in \mathbb{R}^d$.
+
+\section{\texttt{block\_attn}}
+
+This corresponds to \texttt{BlockAttentionResidualMixer}.
+
+\subsection{Query}
+
+The query is a learned per-step vector:
+\begin{equation}
+    q_t \in \mathbb{R}^d.
+\end{equation}
+
+In code, this is implemented as a step-indexed lookup from a learned query table.
+
+\subsection{Attention Logits}
+
+For each source $s_i \in \mathcal{S}_t$, the attention logit is
+\begin{equation}
+    \ell_{t,i}
+    =
+    \langle q_t, s_i \rangle \cdot \gamma(s_i),
+\end{equation}
+where the source-dependent scale is
+\begin{equation}
+    \gamma(s_i)
+    =
+    \frac{\sqrt{d}}{\lVert s_i \rVert + \varepsilon}.
+\end{equation}
+
+\subsection{Attention Weights}
+
+The weights are normalized by a softmax over all depth sources:
+\begin{equation}
+    a_{t,i}
+    =
+    \operatorname{softmax}_i(\ell_{t,i}).
+\end{equation}
+
+\subsection{Mixed Input}
+
+The mixed depth representation is
+\begin{equation}
+    \tilde{x}_t
+    =
+    \sum_i a_{t,i} s_i.
+\end{equation}
+
+This $\tilde{x}_t$ is directly used as the input to the branch module.
+Therefore, for \texttt{block\_attn},
+\begin{equation}
+    x_t^{\text{branch-in}} = \tilde{x}_t.
+\end{equation}
+
+\paragraph{Interpretation.}
+The current sublayer input is fully determined by depth attention over the block-level history.
+
+\section{\texttt{block\_depth}}
+
+This is the unified Block-Depth mHC variant implemented inside \texttt{MHCLite}.
+
+\subsection{Step 1: mHC-lite Branch Input}
+
+First, the standard \texttt{MHCLite} width connection produces a branch input
+\begin{equation}
+    h_t = \operatorname{MHCLiteWidthConnection}(x_t).
+\end{equation}
+
+Thus, unlike \texttt{block\_attn}, the method begins from the usual mHC-lite branch input.
+
+\subsection{Step 2: Dynamic Query}
+
+The query is not a step-indexed learned vector. Instead, it is dynamically generated from the current context:
+\begin{equation}
+    q_t = c_t W_q,
+\end{equation}
+where
+\begin{itemize}
+    \item $c_t$ is the normalized stream-aware context,
+    \item $W_q$ is the learned query projection.
+\end{itemize}
+
+\subsection{Step 3: Attention over Block Memory}
+
+For each source $s_i \in \mathcal{S}_t$, the attention logit is
+\begin{equation}
+    \ell_{t,i}
+    =
+    \langle q_t, s_i \rangle \cdot \gamma(s_i),
+\end{equation}
+with the same source scaling
+\begin{equation}
+    \gamma(s_i)
+    =
+    \frac{\sqrt{d}}{\lVert s_i \rVert + \varepsilon}.
+\end{equation}
+
+The attention weights are
+\begin{equation}
+    a_{t,i}
+    =
+    \operatorname{softmax}_i(\ell_{t,i}),
+\end{equation}
+and the memory aggregation is
+\begin{equation}
+    m_t
+    =
+    \sum_i a_{t,i} s_i.
+\end{equation}
+
+\subsection{Step 4: Gated Fusion}
+
+The key difference from \texttt{block\_attn} is that \texttt{block\_depth} does not replace the branch input outright.
+Instead, it computes a gate
+\begin{equation}
+    g_t
+    =
+    \sigma(c_t W_g + b_g),
+\end{equation}
+where $\sigma(\cdot)$ is the sigmoid function.
+
+The final branch input is then
+\begin{equation}
+    \tilde{h}_t
+    =
+    h_t + g_t \odot (m_t - h_t).
+\end{equation}
+
+Equivalently,
+\begin{equation}
+    \tilde{h}_t
+    =
+    (1 - g_t) \odot h_t + g_t \odot m_t.
+\end{equation}
+
+\paragraph{Interpretation.}
+The branch input is a gated interpolation between
+\begin{itemize}
+    \item the original mHC-lite branch input $h_t$,
+    \item the block-level memory readout $m_t$.
+\end{itemize}
+
+\section{Side-by-Side Comparison}
+
+\subsection{\texttt{block\_attn}}
+
+\begin{align}
+    q_t &= \text{learned table lookup}(t), \\
+    a_{t,i} &= \operatorname{softmax}_i\!\big(\langle q_t, s_i \rangle \gamma(s_i)\big), \\
+    \tilde{x}_t &= \sum_i a_{t,i} s_i.
+\end{align}
+
+\paragraph{Characteristics.}
+\begin{itemize}
+    \item Query is a static learned vector indexed by step.
+    \item Output is fully determined by depth history.
+    \item No extra gate is used.
+    \item Depth attention is implemented \emph{outside} mHC-lite.
+\end{itemize}
+
+\subsection{\texttt{block\_depth}}
+
+\begin{align}
+    h_t &= \operatorname{MHCLiteWidthConnection}(x_t), \\
+    q_t &= c_t W_q, \\
+    a_{t,i} &= \operatorname{softmax}_i\!\big(\langle q_t, s_i \rangle \gamma(s_i)\big), \\
+    m_t &= \sum_i a_{t,i} s_i, \\
+    g_t &= \sigma(c_t W_g + b_g), \\
+    \tilde{h}_t &= (1-g_t)\odot h_t + g_t \odot m_t.
+\end{align}
+
+\paragraph{Characteristics.}
+\begin{itemize}
+    \item Query is dynamically generated from the current context.
+    \item mHC-lite first computes its own branch input $h_t$.
+    \item Block memory is then fused through a gate.
+    \item Depth read is implemented \emph{inside} mHC-lite.
+\end{itemize}
+
+\section{One-Sentence Summary}
+
+\texttt{block\_attn} can be viewed as
+\begin{quote}
+``the current sublayer input equals the attention result over block-level history.''
+\end{quote}
+
+\texttt{block\_depth} can be viewed as
+\begin{quote}
+``the current sublayer input is the mHC-lite branch input, gated toward a block-memory attention readout.''
+\end{quote}
+
+Thus, \texttt{block\_depth} keeps the mHC-lite baseline path and adds a depth-memory correction, whereas \texttt{block\_attn} directly replaces the input by the block-attended history.
+
+\end{document}
