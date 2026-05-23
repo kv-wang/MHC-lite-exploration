@@ -64,14 +64,53 @@ def sinkhorn_knopps(log_alpha, iters=20):
 
     return log_alpha.exp()
 
-def project_simplex(x, dim=-1):
+def sinkhorn_with_marginals(log_alpha, row_targets, col_targets, iters=20):
+    row_targets = row_targets.to(device=log_alpha.device, dtype=log_alpha.dtype)
+    col_targets = col_targets.to(device=log_alpha.device, dtype=log_alpha.dtype)
+    log_row_targets = row_targets.clamp_min(torch.finfo(log_alpha.dtype).tiny).log()
+    log_col_targets = col_targets.clamp_min(torch.finfo(log_alpha.dtype).tiny).log()
+
+    for _ in range(iters):
+        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-2, keepdim=True)
+        log_alpha = log_alpha + log_col_targets.view(*((1,) * (log_alpha.ndim - 1)), -1)
+        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-1, keepdim=True)
+        log_alpha = log_alpha + log_row_targets.view(*((1,) * (log_alpha.ndim - 2)), -1, 1)
+
+    return log_alpha.exp()
+
+def sinkhorn_with_capacity(log_alpha, base_streams, cap=1., iters=20):
+    # Base rows / cols use equality constraints; added rows / cols use capacity constraints.
+    cap = torch.as_tensor(cap, device=log_alpha.device, dtype=log_alpha.dtype)
+    log_cap = cap.clamp_min(torch.finfo(log_alpha.dtype).tiny).log()
+    rows = log_alpha.shape[-2]
+    cols = log_alpha.shape[-1]
+    base_streams = min(base_streams, rows, cols)
+
+    row_is_base = torch.arange(rows, device=log_alpha.device) < base_streams
+    row_is_base = row_is_base.view(*((1,) * (log_alpha.ndim - 2)), rows, 1)
+    col_is_base = torch.arange(cols, device=log_alpha.device) < base_streams
+    col_is_base = col_is_base.view(*((1,) * (log_alpha.ndim - 1)), cols)
+
+    for _ in range(iters):
+        row_logsum = torch.logsumexp(log_alpha, dim=-1, keepdim=True)
+        row_cap_scale = torch.minimum(torch.zeros_like(row_logsum), log_cap - row_logsum)
+        log_alpha = log_alpha + torch.where(row_is_base, -row_logsum, row_cap_scale)
+
+        col_logsum = torch.logsumexp(log_alpha, dim=-2, keepdim=True)
+        col_cap_scale = torch.minimum(torch.zeros_like(col_logsum), log_cap - col_logsum)
+        log_alpha = log_alpha + torch.where(col_is_base, -col_logsum, col_cap_scale)
+
+    return log_alpha.exp()
+
+def project_simplex(x, dim=-1, target=1.):
     dim = dim if dim >= 0 else x.ndim + dim
+    target = torch.as_tensor(target, device=x.device, dtype=x.dtype)
     x = x.movedim(dim, -1)
     shape = x.shape
     x_flat = x.reshape(-1, shape[-1])
 
     sorted_x, _ = torch.sort(x_flat, dim=-1, descending=True)
-    cssv = sorted_x.cumsum(dim=-1) - 1
+    cssv = sorted_x.cumsum(dim=-1) - target
     ind = torch.arange(1, shape[-1] + 1, device=x.device, dtype=x.dtype)
     support = sorted_x - cssv / ind > 0
     rho = support.sum(dim=-1, keepdim=True).clamp_min(1)
@@ -80,11 +119,30 @@ def project_simplex(x, dim=-1):
     projected = (x_flat - theta).clamp_min(0)
     return projected.reshape(shape).movedim(-1, dim)
 
+def project_nonnegative_l1_ball(x, cap=1., dim=-1):
+    cap = torch.as_tensor(cap, device=x.device, dtype=x.dtype)
+    x_pos = x.clamp_min(0)
+    x_sum = x_pos.sum(dim=dim, keepdim=True)
+    projected = project_simplex(x, dim=dim, target=cap)
+    return torch.where(x_sum <= cap, x_pos, projected)
+
 def project_rows(x):
     return project_simplex(x, dim=-1)
 
 def project_cols(x):
     return project_simplex(x.mT, dim=-1).mT
+
+def project_mixed_rows(x, base_streams, cap=1.):
+    rows = x.shape[-2]
+    base_streams = min(base_streams, rows)
+    row_is_base = torch.arange(rows, device=x.device) < base_streams
+    row_is_base = row_is_base.view(*((1,) * (x.ndim - 2)), rows, 1)
+    equality = project_simplex(x, dim=-1)
+    capacity = project_nonnegative_l1_ball(x, cap=cap, dim=-1)
+    return torch.where(row_is_base, equality, capacity)
+
+def project_mixed_cols(x, base_streams, cap=1.):
+    return project_mixed_rows(x.mT, base_streams=base_streams, cap=cap).mT
 
 def admm_doubly_stochastic(log_alpha, iters=20, rho=1.):
     a = torch.softmax(log_alpha, dim=-1)
@@ -95,6 +153,19 @@ def admm_doubly_stochastic(log_alpha, iters=20, rho=1.):
     for _ in range(iters):
         x1 = project_rows((a + rho * (x2 - u)) / (1. + rho))
         x2 = project_cols(x1 + u)
+        u = u + x1 - x2
+
+    return 0.5 * (x1 + x2)
+
+def admm_with_capacity(log_alpha, base_streams, cap=1., iters=20, rho=1.):
+    a = log_alpha.exp()
+    x1 = project_mixed_rows(a, base_streams=base_streams, cap=cap)
+    x2 = project_mixed_cols(a, base_streams=base_streams, cap=cap)
+    u = torch.zeros_like(a)
+
+    for _ in range(iters):
+        x1 = project_mixed_rows((a + rho * (x2 - u)) / (1. + rho), base_streams=base_streams, cap=cap)
+        x2 = project_mixed_cols(x1 + u, base_streams=base_streams, cap=cap)
         u = u + x1 - x2
 
     return 0.5 * (x1 + x2)
@@ -117,19 +188,33 @@ def get_expand_reduce_stream_functions(
     dim = None,
     disable = False,
     reduce_stream_mode = "sum",
+    expand_stream_mode = "repeat",
+    expand_active_streams = None,
 ):
     if num_streams == 1 or disable:
         return (nn.Identity(), nn.Identity())
 
     if reduce_stream_mode not in {"sum", "mean"}:
         raise ValueError(f"Invalid reduce_stream_mode: {reduce_stream_mode}")
+    if expand_stream_mode not in {"repeat", "split", "repeat_base_zero_rest"}:
+        raise ValueError(f"Invalid expand_stream_mode: {expand_stream_mode}")
 
     if add_stream_embed:
         assert exists(dim), '`dim` must be passed into get_init_and_expand_reduce_stream_functions for returning an expansion function with stream embeddings added'
 
-        expand_fn = StreamEmbed(num_streams, dim, expand_to_streams = True)
+        expand_fn = StreamEmbed(
+            num_streams,
+            dim,
+            expand_to_streams = True,
+            expand_stream_mode = expand_stream_mode,
+            expand_active_streams = expand_active_streams,
+        )
     else:
-        expand_fn = Reduce(pattern = 'b ... -> (b s) ...', reduction = 'repeat', s = num_streams)
+        expand_fn = ExpandStreams(
+            num_streams,
+            mode = expand_stream_mode,
+            active_streams = expand_active_streams,
+        )
 
     reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = reduce_stream_mode, s = num_streams)
 
@@ -143,6 +228,7 @@ def get_init_and_expand_reduce_stream_functions(
     disable = None,
     sinkhorn_iters = 20,
     reduce_stream_mode = "sum",
+    expand_stream_mode = "repeat",
     **kwargs
 ):
     disable = default(disable, num_streams == 1 and num_fracs == 1)
@@ -150,12 +236,18 @@ def get_init_and_expand_reduce_stream_functions(
     hyper_conn_klass = ManifoldConstrainedHyperConnections if not disable else Residual
 
     init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, num_fracs = num_fracs, sinkhorn_iters = sinkhorn_iters, **kwargs)
+    expand_active_streams = None
+    if expand_stream_mode == "repeat_base_zero_rest":
+        expand_active_streams = kwargs.get("mhc_adapter_base_streams", num_streams)
+
     expand_reduce_fns = get_expand_reduce_stream_functions(
         num_streams,
         add_stream_embed = add_stream_embed,
         dim = dim,
         disable = disable,
         reduce_stream_mode = reduce_stream_mode,
+        expand_stream_mode = expand_stream_mode,
+        expand_active_streams = expand_active_streams,
     )
 
     if exists(dim):
@@ -268,18 +360,27 @@ class ManifoldConstrainedHyperConnections(Module):
         mhc_h_res_mode = "sinkhorn",
         mhc_admm_iters = 20,
         mhc_admm_rho = 1.,
+        mhc_adapter_base_streams = 4,
+        mhc_adapter_epsilon = 0.1,
+        mhc_adapter_cap = 1.,
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
         """
         super().__init__()
-        valid_h_res_modes = {"sinkhorn", "admm", "cayley"}
+        valid_h_res_modes = {"sinkhorn", "admm", "cayley", "adapter_epsilon", "adapter_cap", "adapter_cap_admm"}
         if mhc_h_res_mode not in valid_h_res_modes:
             raise ValueError(f"Invalid mhc_h_res_mode: {mhc_h_res_mode}")
         if mhc_admm_iters < 1:
             raise ValueError("mhc_admm_iters must be >= 1")
         if mhc_admm_rho <= 0:
             raise ValueError("mhc_admm_rho must be > 0")
+        if mhc_adapter_base_streams < 1:
+            raise ValueError("mhc_adapter_base_streams must be >= 1")
+        if mhc_adapter_epsilon <= 0:
+            raise ValueError("mhc_adapter_epsilon must be > 0")
+        if mhc_adapter_cap <= 0:
+            raise ValueError("mhc_adapter_cap must be > 0")
 
         self.branch = branch
 
@@ -376,6 +477,9 @@ class ManifoldConstrainedHyperConnections(Module):
         self.mhc_h_res_mode = mhc_h_res_mode
         self.mhc_admm_iters = mhc_admm_iters
         self.mhc_admm_rho = mhc_admm_rho
+        self.mhc_adapter_base_streams = mhc_adapter_base_streams
+        self.mhc_adapter_epsilon = mhc_adapter_epsilon
+        self.mhc_adapter_cap = mhc_adapter_cap
 
         # dropouts
 
@@ -422,6 +526,10 @@ class ManifoldConstrainedHyperConnections(Module):
         normed = rearrange(residuals, 'b ... s d -> b ... (s d)', s = streams)
         # normed = F.normalize(normed, dim = -1)
         normed = self.norm(normed)
+        if self.mhc_h_res_mode in {"adapter_epsilon", "adapter_cap", "adapter_cap_admm"}:
+            base_streams = min(self.mhc_adapter_base_streams, streams)
+            if base_streams < streams:
+                normed = normed * ((base_streams / streams) ** 0.5)
 
         # alpha for weighted sum of residuals going into branch
         wc_weight = normed @ self.dynamic_alpha_fn # ... f (s v+s)
@@ -490,6 +598,36 @@ class ManifoldConstrainedHyperConnections(Module):
                 alpha_residual = rearrange(alpha_residual, '... f s g t -> ... f g s t')
                 if self.mhc_h_res_mode == "sinkhorn":
                     alpha_residual = sinkhorn_knopps(alpha_residual, self.sinkhorn_iters)
+                elif self.mhc_h_res_mode == "adapter_epsilon":
+                    target = torch.full(
+                        (streams,),
+                        self.mhc_adapter_epsilon,
+                        device=alpha_residual.device,
+                        dtype=alpha_residual.dtype,
+                    )
+                    base_streams = min(self.mhc_adapter_base_streams, streams)
+                    target[:base_streams] = 1.
+                    alpha_residual = sinkhorn_with_marginals(
+                        alpha_residual,
+                        row_targets=target,
+                        col_targets=target,
+                        iters=self.sinkhorn_iters,
+                    )
+                elif self.mhc_h_res_mode == "adapter_cap":
+                    alpha_residual = sinkhorn_with_capacity(
+                        alpha_residual,
+                        base_streams=min(self.mhc_adapter_base_streams, streams),
+                        cap=self.mhc_adapter_cap,
+                        iters=self.sinkhorn_iters,
+                    )
+                elif self.mhc_h_res_mode == "adapter_cap_admm":
+                    alpha_residual = admm_with_capacity(
+                        alpha_residual,
+                        base_streams=min(self.mhc_adapter_base_streams, streams),
+                        cap=self.mhc_adapter_cap,
+                        iters=self.mhc_admm_iters,
+                        rho=self.mhc_admm_rho,
+                    )
                 else:
                     alpha_residual = admm_doubly_stochastic(
                         alpha_residual,
@@ -620,25 +758,59 @@ ManifoldConstrainedHyperConnections.get_init_and_expand_reduce_stream_functions 
 
 # stream embed
 
+class ExpandStreams(Module):
+    def __init__(
+        self,
+        num_streams,
+        mode = "repeat",
+        active_streams = None,
+    ):
+        super().__init__()
+        self.num_streams = num_streams
+        self.mode = mode
+        self.active_streams = num_streams if active_streams is None else min(active_streams, num_streams)
+
+    def forward(self, residuals):
+        residuals = repeat(residuals, 'b ... -> b s ...', s = self.num_streams)
+
+        if self.mode == "split":
+            residuals = residuals / self.num_streams
+        elif self.mode == "repeat_base_zero_rest":
+            mask = torch.arange(self.num_streams, device=residuals.device) < self.active_streams
+            residuals = residuals * mask.view(1, self.num_streams, *([1] * (residuals.ndim - 2)))
+
+        residuals = rearrange(residuals, 'b s ... -> (b s) ...')
+        return residuals
+
 class StreamEmbed(Module):
     def __init__(
         self,
         num_streams,
         dim,
         channel_first = False,
-        expand_to_streams = False
+        expand_to_streams = False,
+        expand_stream_mode = "repeat",
+        expand_active_streams = None,
     ):
         super().__init__()
         self.channel_first = channel_first
         self.num_streams = num_streams
 
         self.expand_to_streams = expand_to_streams
+        self.expand_stream_mode = expand_stream_mode
+        self.expand_active_streams = num_streams if expand_active_streams is None else min(expand_active_streams, num_streams)
         self.stream_embed = nn.Parameter(torch.zeros(num_streams, dim))
 
     def forward(self, residuals):
 
         if self.expand_to_streams:
-            residuals = repeat(residuals, 'b ... -> (b s) ...', s = self.num_streams)
+            residuals = repeat(residuals, 'b ... -> b s ...', s = self.num_streams)
+            if self.expand_stream_mode == "split":
+                residuals = residuals / self.num_streams
+            elif self.expand_stream_mode == "repeat_base_zero_rest":
+                mask = torch.arange(self.num_streams, device=residuals.device) < self.expand_active_streams
+                residuals = residuals * mask.view(1, self.num_streams, *([1] * (residuals.ndim - 2)))
+            residuals = rearrange(residuals, 'b s ... -> (b s) ...')
 
         if self.channel_first:
             residuals = rearrange(residuals, '(b s) d ... -> b ... s d', s = self.num_streams)

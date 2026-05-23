@@ -43,6 +43,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # ----- hyper conn start -----
 hyper_conn_type = "none" # none, hc, mhc, mhc_lite
 hyper_conn_n = 1 # num_streams
+hyper_conn_expand_stream_mode = "repeat" # "repeat" or "split" for initial multi-stream expansion
 
 # ----- hyper conn end -----
 
@@ -198,7 +199,8 @@ model_args = dict(
     vocab_size=vocab_size, 
     dropout=dropout,
     hyper_conn_n=hyper_conn_n,
-    hyper_conn_type=hyper_conn_type
+    hyper_conn_type=hyper_conn_type,
+    hyper_conn_expand_stream_mode=hyper_conn_expand_stream_mode,
 ) # start with model_args from command line
 if master_process:
     print ("="*100)

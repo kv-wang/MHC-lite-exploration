@@ -1,4 +1,4 @@
-eval_interval = 500
+eval_interval = 100
 eval_iters = 200
 log_interval = 10
 always_save_checkpoint = False

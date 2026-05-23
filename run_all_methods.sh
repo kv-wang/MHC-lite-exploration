@@ -22,6 +22,7 @@ TRAIN_CONFIG="${TRAIN_CONFIG:-config/train_owt.py}"
 MODEL_CONFIG="${MODEL_CONFIG:-config/large_model.py}"
 WANDB_PROJECT="${WANDB_PROJECT:-mhc-lite-large_owt}"
 NUM_STREAMS="${NUM_STREAMS:-}"
+EXPAND_STREAM_MODE="${EXPAND_STREAM_MODE:-}"
 
 run_one() {
   local name="$1"
@@ -38,12 +39,14 @@ run_one() {
       --wandb_log_layer_stats=False \
       --wandb_log_layer_cosine=False \
       ${NUM_STREAMS:+--num_streams="$NUM_STREAMS"} \
+      ${EXPAND_STREAM_MODE:+--expand_stream_mode="$EXPAND_STREAM_MODE"} \
       "$@"
   else
     python train.py \
       "$TRAIN_CONFIG" "$MODEL_CONFIG" \
       --wandb_project="$WANDB_PROJECT" \
       ${NUM_STREAMS:+--num_streams="$NUM_STREAMS"} \
+      ${EXPAND_STREAM_MODE:+--expand_stream_mode="$EXPAND_STREAM_MODE"} \
       "$@"
   fi
 }

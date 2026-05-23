@@ -158,12 +158,16 @@ class GPTConfig:
     hyper_conn_n: int = 1
     hyper_conn_type: str = "none"
     hyper_conn_reduce_stream_mode: str = "sum"
+    hyper_conn_expand_stream_mode: str = "repeat"
     mhc_gate_fn: str = "sigmoid"
     mhc_zero_init_pre_post_logits: bool = False
     mhc_identity_h_res: bool = False
     mhc_h_res_mode: str = "sinkhorn"
     mhc_admm_iters: int = 20
     mhc_admm_rho: float = 1.0
+    mhc_adapter_base_streams: int = 4
+    mhc_adapter_epsilon: float = 0.1
+    mhc_adapter_cap: float = 1.0
     mhc_lite_h_res_mode: str = "doubly_stochastic"
     mhc_lite_ns_steps: int = 5
     mhc_lite_method: str = "base"
@@ -189,6 +193,9 @@ class GPT(nn.Module):
                 mhc_h_res_mode=config.mhc_h_res_mode,
                 mhc_admm_iters=config.mhc_admm_iters,
                 mhc_admm_rho=config.mhc_admm_rho,
+                mhc_adapter_base_streams=config.mhc_adapter_base_streams,
+                mhc_adapter_epsilon=config.mhc_adapter_epsilon,
+                mhc_adapter_cap=config.mhc_adapter_cap,
             )
         if config.hyper_conn_type == "analysis":
             hc_kwargs.update(
@@ -216,6 +223,7 @@ class GPT(nn.Module):
                 config.hyper_conn_type,
                 config.hyper_conn_n,
                 reduce_stream_mode=config.hyper_conn_reduce_stream_mode,
+                expand_stream_mode=config.hyper_conn_expand_stream_mode,
                 **hc_kwargs,
             )
             if config.hyper_conn_type == "mhc_lite" and config.mhc_lite_method == "depth_attn":

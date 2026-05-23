@@ -19,6 +19,7 @@ from ast import literal_eval
 
 ALIASES = {
     "num_streams": "hyper_conn_n",
+    "expand_stream_mode": "hyper_conn_expand_stream_mode",
 }
 
 for arg in sys.argv[1:]:

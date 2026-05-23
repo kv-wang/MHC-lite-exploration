@@ -43,12 +43,20 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 hyper_conn_type = "none" # none, hc, mhc, mhc_lite, attn_res
 hyper_conn_n = 1 # num_streams
 hyper_conn_reduce_stream_mode = "sum" # "sum" or "mean" for final multi-stream reduction
+hyper_conn_expand_stream_mode = "repeat" # "repeat", "split", or "repeat_base_zero_rest" for initial multi-stream expansion
 mhc_gate_fn = "sigmoid"    # "softmax" or "sigmoid" for H_pre/H_post (mhc/mhc_lite only)
 mhc_zero_init_pre_post_logits = False # True = initialize H_pre/H_post static logits to all zeros (mhc only)
 mhc_identity_h_res = False # True = H_res fixed to I, no stream mixing (mhc/mhc_lite only)
-mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", or "cayley" for H_res (mhc only)
-mhc_admm_iters = 20        # ADMM steps for H_res when mhc_h_res_mode="admm"
-mhc_admm_rho = 1.0         # ADMM penalty for H_res when mhc_h_res_mode="admm"
+mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
+mhc_admm_iters = 20        # ADMM steps for H_res when mhc_h_res_mode uses ADMM
+mhc_admm_rho = 1.0         # ADMM penalty for H_res when mhc_h_res_mode uses ADMM
+mhc_adapter_ckpt_path = "out-owt-medium-mhc-num-streams-4/ckpt.pt"
+mhc_adapter_base_streams = 4
+mhc_adapter_epsilon = 0.1
+mhc_adapter_cap = 1.0
+mhc_adapter_cross_logit = -40.0
+mhc_adapter_new_block_logit = -40.0
+mhc_adapter_inactive_logit = -40.0
 mhc_lite_h_res_mode = "doubly_stochastic" # "doubly_stochastic" or "newton_schulz" for H_res (mhc_lite only)
 mhc_lite_ns_steps = 5      # Newton-Schulz steps for H_res when mhc_lite_h_res_mode="newton_schulz"
 mhc_lite_method = "base"   # base, selective, depth_attn, block_attn, block_depth
@@ -67,7 +75,7 @@ log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'scratch' # 'scratch', 'resume', 'mhc_adapter', or 'gpt2*'
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'owt'
@@ -128,6 +136,8 @@ if wandb_run_name == 'exp':
             tag += f"-{mhc_lite_h_res_mode.replace('_', '-')}"
         if mhc_identity_h_res:
             tag += "-idH"
+        if hyper_conn_expand_stream_mode != "repeat":
+            tag += f"-expand-{hyper_conn_expand_stream_mode}"
         wandb_run_name = tag
     elif hyper_conn_type == "attn_res":
         wandb_run_name = "attn-res"
@@ -241,18 +251,126 @@ model_args = dict(
     hyper_conn_n=hyper_conn_n,
     hyper_conn_type=hyper_conn_type,
     hyper_conn_reduce_stream_mode=hyper_conn_reduce_stream_mode,
+    hyper_conn_expand_stream_mode=hyper_conn_expand_stream_mode,
     mhc_gate_fn=mhc_gate_fn,
     mhc_zero_init_pre_post_logits=mhc_zero_init_pre_post_logits,
     mhc_identity_h_res=mhc_identity_h_res,
     mhc_h_res_mode=mhc_h_res_mode,
     mhc_admm_iters=mhc_admm_iters,
     mhc_admm_rho=mhc_admm_rho,
+    mhc_adapter_base_streams=mhc_adapter_base_streams,
+    mhc_adapter_epsilon=mhc_adapter_epsilon,
+    mhc_adapter_cap=mhc_adapter_cap,
     mhc_lite_h_res_mode=mhc_lite_h_res_mode,
     mhc_lite_ns_steps=mhc_lite_ns_steps,
     mhc_lite_method=mhc_lite_method,
     mhc_lite_perm_topk=mhc_lite_perm_topk,
     mhc_lite_block_size=mhc_lite_block_size,
 )
+
+def strip_compile_prefix(state_dict):
+    unwanted_prefix = '_orig_mod.'
+    fixed = {}
+    for k, v in state_dict.items():
+        if k.startswith(unwanted_prefix):
+            k = k[len(unwanted_prefix):]
+        fixed[k] = v
+    return fixed
+
+def adapt_mhc_4_to_n_state_dict(
+    target_state,
+    source_state,
+    base_streams,
+    target_streams,
+    cross_logit,
+    new_block_logit,
+    inactive_logit,
+):
+    adapted = {k: v.clone() for k, v in target_state.items()}
+    copied_equal = 0
+    copied_adapted = 0
+
+    for k, v in source_state.items():
+        if k in adapted and adapted[k].shape == v.shape:
+            adapted[k].copy_(v)
+            copied_equal += 1
+
+    for k, old in source_state.items():
+        if k not in adapted or adapted[k].shape == old.shape:
+            continue
+
+        new = adapted[k]
+
+        if k.endswith(".static_alpha"):
+            old_streams = old.shape[0]
+            new_streams = new.shape[0]
+            old_views = old.shape[1] - old_streams
+            new_views = new.shape[1] - new_streams
+            if old_streams != base_streams or new_streams != target_streams or old_views != new_views:
+                continue
+
+            new[:base_streams, :new_views].copy_(old[:base_streams, :old_views])
+            new[base_streams:, :new_views] = inactive_logit
+            new[:base_streams, new_views:new_views + base_streams].copy_(old[:base_streams, old_views:])
+            new[:base_streams, new_views + base_streams:] = cross_logit
+            new[base_streams:, new_views:new_views + base_streams] = cross_logit
+            new[base_streams:, new_views + base_streams:] = new_block_logit
+            copied_adapted += 1
+
+        elif k.endswith(".dynamic_alpha_fn"):
+            old_streams = base_streams
+            new_streams = target_streams
+            old_dim = old.shape[0] // old_streams
+            new_dim = new.shape[0] // new_streams
+            old_t = old.shape[1] // old_streams
+            new_t = new.shape[1] // new_streams
+            old_views = old_t - old_streams
+            new_views = new_t - new_streams
+            if old_dim != new_dim or old_views != new_views:
+                continue
+
+            old_rows = old_streams * old_dim
+            new.zero_()
+            for source_idx in range(base_streams):
+                old_col = source_idx * old_t
+                new_col = source_idx * new_t
+                new[:old_rows, new_col:new_col + new_views].copy_(
+                    old[:old_rows, old_col:old_col + old_views]
+                )
+                new[:old_rows, new_col + new_views:new_col + new_views + base_streams].copy_(
+                    old[:old_rows, old_col + old_views:old_col + old_t]
+                )
+            copied_adapted += 1
+
+        elif k.endswith(".static_beta"):
+            if old.shape[0] != base_streams or new.shape[0] != target_streams:
+                continue
+            new[:base_streams].copy_(old)
+            new[base_streams:] = inactive_logit
+            copied_adapted += 1
+
+        elif k.endswith(".dynamic_beta_fn"):
+            old_dim = old.shape[0] // base_streams
+            new_dim = new.shape[0] // target_streams
+            if old_dim != new_dim or old.shape[1] != base_streams or new.shape[1] != target_streams:
+                continue
+            old_rows = base_streams * old_dim
+            new.zero_()
+            new[:old_rows, :base_streams].copy_(old)
+            copied_adapted += 1
+
+        elif k.endswith(".norm.gamma"):
+            old_dim = old.shape[0] // base_streams
+            new_dim = new.shape[0] // target_streams
+            if old_dim != new_dim:
+                continue
+            old_len = base_streams * old_dim
+            new[:old_len].copy_(old)
+            copied_adapted += 1
+
+    print(f"mHC adapter copied {copied_equal} same-shape tensors and adapted {copied_adapted} tensors")
+    return adapted
+
 if master_process:
     print ("="*100)
     for k, v in model_args.items():
@@ -281,16 +399,43 @@ elif init_from == 'resume':
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    state_dict = strip_compile_prefix(checkpoint['model'])
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+elif init_from == 'mhc_adapter':
+    print(f"Initializing mHC adapter from {mhc_adapter_ckpt_path}")
+    if hyper_conn_type != "mhc":
+        raise ValueError("init_from='mhc_adapter' requires hyper_conn_type='mhc'")
+    if hyper_conn_n < mhc_adapter_base_streams:
+        raise ValueError("hyper_conn_n must be >= mhc_adapter_base_streams")
+
+    checkpoint = torch.load(mhc_adapter_ckpt_path, map_location='cpu')
+    checkpoint_model_args = checkpoint['model_args']
+    source_streams = checkpoint_model_args.get('hyper_conn_n')
+    if source_streams != mhc_adapter_base_streams:
+        raise ValueError(
+            f"adapter checkpoint has {source_streams} streams, expected {mhc_adapter_base_streams}"
+        )
+
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = checkpoint_model_args[k]
+
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+    source_state = strip_compile_prefix(checkpoint['model'])
+    adapted_state = adapt_mhc_4_to_n_state_dict(
+        model.state_dict(),
+        source_state,
+        base_streams=mhc_adapter_base_streams,
+        target_streams=hyper_conn_n,
+        cross_logit=mhc_adapter_cross_logit,
+        new_block_logit=mhc_adapter_new_block_logit,
+        inactive_logit=mhc_adapter_inactive_logit,
+    )
+    model.load_state_dict(adapted_state)
+    iter_num = 0
+    best_val_loss = 1e9
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights

@@ -64,19 +64,22 @@ def get_expand_reduce_stream_functions(
     dim = None,
     disable = False,
     reduce_stream_mode = "sum",
+    expand_stream_mode = "repeat",
 ):
     if num_streams == 1 or disable:
         return (nn.Identity(), nn.Identity())
 
     if reduce_stream_mode not in {"sum", "mean"}:
         raise ValueError(f"Invalid reduce_stream_mode: {reduce_stream_mode}")
+    if expand_stream_mode not in {"repeat", "split"}:
+        raise ValueError(f"Invalid expand_stream_mode: {expand_stream_mode}")
 
     if add_stream_embed:
         assert exists(dim), '`dim` must be passed into get_init_and_expand_reduce_stream_functions for returning an expansion function with stream embeddings added'
 
-        expand_fn = StreamEmbed(num_streams, dim, expand_to_streams = True)
+        expand_fn = StreamEmbed(num_streams, dim, expand_to_streams = True, expand_stream_mode = expand_stream_mode)
     else:
-        expand_fn = Reduce(pattern = 'b ... -> (b s) ...', reduction = 'repeat', s = num_streams)
+        expand_fn = ExpandStreams(num_streams, mode = expand_stream_mode)
 
     reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = reduce_stream_mode, s = num_streams)
 
@@ -90,6 +93,7 @@ def get_init_and_expand_reduce_stream_functions(
     disable = None,
     sinkhorn_iters = 20,
     reduce_stream_mode = "sum",
+    expand_stream_mode = "repeat",
     **kwargs
 ):
     disable = default(disable, num_streams == 1 and num_fracs == 1)
@@ -103,6 +107,7 @@ def get_init_and_expand_reduce_stream_functions(
         dim = dim,
         disable = disable,
         reduce_stream_mode = reduce_stream_mode,
+        expand_stream_mode = expand_stream_mode,
     )
 
     if exists(dim):
@@ -518,25 +523,47 @@ MHCAnalysis.get_init_and_expand_reduce_stream_functions = staticmethod(get_init_
 
 # stream embed
 
+class ExpandStreams(Module):
+    def __init__(
+        self,
+        num_streams,
+        mode = "repeat"
+    ):
+        super().__init__()
+        self.num_streams = num_streams
+        self.mode = mode
+
+    def forward(self, residuals):
+        residuals = repeat(residuals, 'b ... -> (b s) ...', s = self.num_streams)
+
+        if self.mode == "split":
+            residuals = residuals / self.num_streams
+
+        return residuals
+
 class StreamEmbed(Module):
     def __init__(
         self,
         num_streams,
         dim,
         channel_first = False,
-        expand_to_streams = False
+        expand_to_streams = False,
+        expand_stream_mode = "repeat"
     ):
         super().__init__()
         self.channel_first = channel_first
         self.num_streams = num_streams
 
         self.expand_to_streams = expand_to_streams
+        self.expand_stream_mode = expand_stream_mode
         self.stream_embed = nn.Parameter(torch.zeros(num_streams, dim))
 
     def forward(self, residuals):
 
         if self.expand_to_streams:
             residuals = repeat(residuals, 'b ... -> (b s) ...', s = self.num_streams)
+            if self.expand_stream_mode == "split":
+                residuals = residuals / self.num_streams
 
         if self.channel_first:
             residuals = rearrange(residuals, '(b s) d ... -> b ... s d', s = self.num_streams)

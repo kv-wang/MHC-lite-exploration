@@ -36,34 +36,40 @@ def hyper_conn_init_func(hyper_conn_type: str, hyper_conn_n: int, **kwargs):
         flag = True
 
     reduce_stream_mode = kwargs.pop("reduce_stream_mode", "sum")
+    expand_stream_mode = kwargs.pop("expand_stream_mode", "repeat")
 
     if hyper_conn_type == "none":
         return get_init_and_expand_reduce_stream_functions(
             hyper_conn_n,
             disable = True,
             reduce_stream_mode = reduce_stream_mode,
+            expand_stream_mode = expand_stream_mode,
         )
     elif hyper_conn_type == "hc":
         return get_init_and_expand_reduce_stream_functions(
             hyper_conn_n,
             reduce_stream_mode = reduce_stream_mode,
+            expand_stream_mode = expand_stream_mode,
         )
     elif hyper_conn_type == "mhc":
         return mc_get_init_and_expand_reduce_stream_functions(
             hyper_conn_n,
             reduce_stream_mode = reduce_stream_mode,
+            expand_stream_mode = expand_stream_mode,
             **kwargs,
         )
     elif hyper_conn_type == "mhc_lite":
         return mhclite_get_init_and_expand_reduce_stream_functions(
             hyper_conn_n,
             reduce_stream_mode = reduce_stream_mode,
+            expand_stream_mode = expand_stream_mode,
             **kwargs,
         )
     elif hyper_conn_type == "analysis":
         return mhc_analysis_get_init_and_expand_reduce_stream_functions(
             hyper_conn_n,
             reduce_stream_mode = reduce_stream_mode,
+            expand_stream_mode = expand_stream_mode,
             **kwargs,
         )
     else:
