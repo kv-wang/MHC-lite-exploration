@@ -168,6 +168,9 @@ class GPTConfig:
     mhc_adapter_base_streams: int = 4
     mhc_adapter_epsilon: float = 0.1
     mhc_adapter_cap: float = 1.0
+    mhc_adapter_admm_input_mode: str = "raw_logits"
+    mhc_adapter_admm_input_floor: float = 1e-30
+    mhc_adapter_admm_checkpoint: bool = False
     mhc_lite_h_res_mode: str = "doubly_stochastic"
     mhc_lite_ns_steps: int = 5
     mhc_lite_method: str = "base"
@@ -196,6 +199,9 @@ class GPT(nn.Module):
                 mhc_adapter_base_streams=config.mhc_adapter_base_streams,
                 mhc_adapter_epsilon=config.mhc_adapter_epsilon,
                 mhc_adapter_cap=config.mhc_adapter_cap,
+                mhc_adapter_admm_input_mode=config.mhc_adapter_admm_input_mode,
+                mhc_adapter_admm_input_floor=config.mhc_adapter_admm_input_floor,
+                mhc_adapter_admm_checkpoint=config.mhc_adapter_admm_checkpoint,
             )
         if config.hyper_conn_type == "analysis":
             hc_kwargs.update(

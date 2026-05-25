@@ -8,6 +8,7 @@ import torch
 from torch import nn, cat
 import torch.nn.functional as F
 from torch.nn import Module, Sequential
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from einops import rearrange, repeat, reduce, einsum
@@ -158,17 +159,52 @@ def admm_doubly_stochastic(log_alpha, iters=20, rho=1.):
     return 0.5 * (x1 + x2)
 
 def admm_with_capacity(log_alpha, base_streams, cap=1., iters=20, rho=1.):
-    a = log_alpha.exp()
-    x1 = project_mixed_rows(a, base_streams=base_streams, cap=cap)
-    x2 = project_mixed_cols(a, base_streams=base_streams, cap=cap)
-    u = torch.zeros_like(a)
+    orig_dtype = log_alpha.dtype
+    work_dtype = torch.float32 if orig_dtype in (torch.float16, torch.bfloat16) else orig_dtype
+    log_alpha = log_alpha.to(work_dtype)
+    rows = log_alpha.shape[-2]
+    cols = log_alpha.shape[-1]
+    base_streams = min(base_streams, rows, cols)
+
+    row_targets = torch.full((rows,), cap, device=log_alpha.device, dtype=work_dtype)
+    row_targets[:base_streams] = 1.
+    row_targets = row_targets.view(*((1,) * (log_alpha.ndim - 2)), rows, 1)
+    col_targets = torch.full((cols,), cap, device=log_alpha.device, dtype=work_dtype)
+    col_targets[:base_streams] = 1.
+    col_targets = col_targets.view(*((1,) * (log_alpha.ndim - 1)), cols)
+
+    row_is_base = torch.arange(rows, device=log_alpha.device) < base_streams
+    row_is_base = row_is_base.view(*((1,) * (log_alpha.ndim - 2)), rows, 1)
+    col_is_base = torch.arange(cols, device=log_alpha.device) < base_streams
+    col_is_base = col_is_base.view(*((1,) * (log_alpha.ndim - 1)), cols)
+
+    row_dual = torch.zeros_like(row_targets).expand(*log_alpha.shape[:-1], 1)
+    col_dual = torch.zeros_like(col_targets).expand(*log_alpha.shape[:-2], 1, cols)
+    log_scale = torch.zeros_like(log_alpha)
+    u = torch.zeros_like(log_alpha)
+    rho = torch.as_tensor(rho, device=log_alpha.device, dtype=work_dtype)
 
     for _ in range(iters):
-        x1 = project_mixed_rows((a + rho * (x2 - u)) / (1. + rho), base_streams=base_streams, cap=cap)
-        x2 = project_mixed_cols(x1 + u, base_streams=base_streams, cap=cap)
-        u = u + x1 - x2
+        target_scale = row_dual + col_dual - u
+        next_log_scale = log_scale
+        for _ in range(8):
+            alpha = (log_alpha + next_log_scale).exp()
+            residual = alpha + rho * (next_log_scale - target_scale)
+            curvature = alpha + rho
+            next_log_scale = next_log_scale - residual / curvature
+        log_scale = next_log_scale
 
-    return 0.5 * (x1 + x2)
+        row_update = (log_scale - col_dual + u).mean(dim=-1, keepdim=True)
+        row_update = row_update + row_targets / (rho * cols)
+        row_dual = torch.where(row_is_base, row_update, row_update.clamp_max(0.))
+
+        col_update = (log_scale - row_dual + u).mean(dim=-2, keepdim=True)
+        col_update = col_update + col_targets / (rho * rows)
+        col_dual = torch.where(col_is_base, col_update, col_update.clamp_max(0.))
+
+        u = u + log_scale - row_dual - col_dual
+
+    return (log_alpha + log_scale).exp().to(orig_dtype)
 
 def cayley_orthogonalize(matrix):
     orig_dtype = matrix.dtype
@@ -363,6 +399,9 @@ class ManifoldConstrainedHyperConnections(Module):
         mhc_adapter_base_streams = 4,
         mhc_adapter_epsilon = 0.1,
         mhc_adapter_cap = 1.,
+        mhc_adapter_admm_input_mode = "raw_logits",
+        mhc_adapter_admm_input_floor = 1e-30,
+        mhc_adapter_admm_checkpoint = False,
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
@@ -371,6 +410,9 @@ class ManifoldConstrainedHyperConnections(Module):
         valid_h_res_modes = {"sinkhorn", "admm", "cayley", "adapter_epsilon", "adapter_cap", "adapter_cap_admm"}
         if mhc_h_res_mode not in valid_h_res_modes:
             raise ValueError(f"Invalid mhc_h_res_mode: {mhc_h_res_mode}")
+        valid_adapter_admm_input_modes = {"raw_logits", "sinkhorn_base_log"}
+        if mhc_adapter_admm_input_mode not in valid_adapter_admm_input_modes:
+            raise ValueError(f"Invalid mhc_adapter_admm_input_mode: {mhc_adapter_admm_input_mode}")
         if mhc_admm_iters < 1:
             raise ValueError("mhc_admm_iters must be >= 1")
         if mhc_admm_rho <= 0:
@@ -381,6 +423,8 @@ class ManifoldConstrainedHyperConnections(Module):
             raise ValueError("mhc_adapter_epsilon must be > 0")
         if mhc_adapter_cap <= 0:
             raise ValueError("mhc_adapter_cap must be > 0")
+        if mhc_adapter_admm_input_floor <= 0:
+            raise ValueError("mhc_adapter_admm_input_floor must be > 0")
 
         self.branch = branch
 
@@ -480,6 +524,9 @@ class ManifoldConstrainedHyperConnections(Module):
         self.mhc_adapter_base_streams = mhc_adapter_base_streams
         self.mhc_adapter_epsilon = mhc_adapter_epsilon
         self.mhc_adapter_cap = mhc_adapter_cap
+        self.mhc_adapter_admm_input_mode = mhc_adapter_admm_input_mode
+        self.mhc_adapter_admm_input_floor = mhc_adapter_admm_input_floor
+        self.mhc_adapter_admm_checkpoint = mhc_adapter_admm_checkpoint
 
         # dropouts
 
@@ -621,13 +668,36 @@ class ManifoldConstrainedHyperConnections(Module):
                         iters=self.sinkhorn_iters,
                     )
                 elif self.mhc_h_res_mode == "adapter_cap_admm":
-                    alpha_residual = admm_with_capacity(
-                        alpha_residual,
-                        base_streams=min(self.mhc_adapter_base_streams, streams),
-                        cap=self.mhc_adapter_cap,
-                        iters=self.mhc_admm_iters,
-                        rho=self.mhc_admm_rho,
-                    )
+                    base_streams = min(self.mhc_adapter_base_streams, streams)
+                    if self.mhc_adapter_admm_input_mode == "sinkhorn_base_log":
+                        base_logits = alpha_residual[..., :base_streams, :base_streams]
+                        base_matrix = sinkhorn_knopps(base_logits, self.sinkhorn_iters)
+                        base_logits_for_admm = base_matrix.clamp_min(
+                            self.mhc_adapter_admm_input_floor
+                        ).log()
+                        alpha_residual = alpha_residual.clone()
+                        alpha_residual[..., :base_streams, :base_streams] = base_logits_for_admm
+                    def project_adapter_cap_admm(logits):
+                        return admm_with_capacity(
+                            logits,
+                            base_streams=base_streams,
+                            cap=self.mhc_adapter_cap,
+                            iters=self.mhc_admm_iters,
+                            rho=self.mhc_admm_rho,
+                        )
+
+                    if (
+                        self.mhc_adapter_admm_checkpoint
+                        and torch.is_grad_enabled()
+                        and alpha_residual.requires_grad
+                    ):
+                        alpha_residual = activation_checkpoint(
+                            project_adapter_cap_admm,
+                            alpha_residual,
+                            use_reentrant=False,
+                        )
+                    else:
+                        alpha_residual = project_adapter_cap_admm(alpha_residual)
                 else:
                     alpha_residual = admm_doubly_stochastic(
                         alpha_residual,

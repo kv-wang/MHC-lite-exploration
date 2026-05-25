@@ -29,6 +29,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from hyper_conn.mhc import sinkhorn_knopps
 from pprint import pprint
 import warnings
 import json
@@ -57,6 +58,12 @@ mhc_adapter_cap = 1.0
 mhc_adapter_cross_logit = -40.0
 mhc_adapter_new_block_logit = -40.0
 mhc_adapter_inactive_logit = -40.0
+mhc_adapter_h_res_init_mode = "copy_logits" # "copy_logits" or "sinkhorn_projected_log"
+mhc_adapter_projected_init_iters = 20
+mhc_adapter_projected_init_floor = 1e-30
+mhc_adapter_admm_input_mode = "raw_logits" # "raw_logits" or "sinkhorn_base_log"
+mhc_adapter_admm_input_floor = 1e-30
+mhc_adapter_admm_checkpoint = False
 mhc_lite_h_res_mode = "doubly_stochastic" # "doubly_stochastic" or "newton_schulz" for H_res (mhc_lite only)
 mhc_lite_ns_steps = 5      # Newton-Schulz steps for H_res when mhc_lite_h_res_mode="newton_schulz"
 mhc_lite_method = "base"   # base, selective, depth_attn, block_attn, block_depth
@@ -75,7 +82,12 @@ log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch', 'resume', 'mhc_adapter', or 'gpt2*'
+init_from = 'scratch' # 'scratch', 'resume', 'continue_ckpt', 'mhc_adapter', or 'gpt2*'
+continue_ckpt_path = "out-owt-medium-mhc-num-streams-4/ckpt.pt"
+continue_load_optimizer = True
+continue_reset_iter = True
+continue_reset_best_val_loss = True
+continue_fixed_lr_from_ckpt = True
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'owt'
@@ -261,6 +273,9 @@ model_args = dict(
     mhc_adapter_base_streams=mhc_adapter_base_streams,
     mhc_adapter_epsilon=mhc_adapter_epsilon,
     mhc_adapter_cap=mhc_adapter_cap,
+    mhc_adapter_admm_input_mode=mhc_adapter_admm_input_mode,
+    mhc_adapter_admm_input_floor=mhc_adapter_admm_input_floor,
+    mhc_adapter_admm_checkpoint=mhc_adapter_admm_checkpoint,
     mhc_lite_h_res_mode=mhc_lite_h_res_mode,
     mhc_lite_ns_steps=mhc_lite_ns_steps,
     mhc_lite_method=mhc_lite_method,
@@ -285,7 +300,18 @@ def adapt_mhc_4_to_n_state_dict(
     cross_logit,
     new_block_logit,
     inactive_logit,
+    h_res_init_mode,
+    projected_init_iters,
+    projected_init_floor,
 ):
+    valid_h_res_init_modes = {"copy_logits", "sinkhorn_projected_log"}
+    if h_res_init_mode not in valid_h_res_init_modes:
+        raise ValueError(f"Invalid mhc_adapter_h_res_init_mode: {h_res_init_mode}")
+    if projected_init_iters < 1:
+        raise ValueError("mhc_adapter_projected_init_iters must be >= 1")
+    if projected_init_floor <= 0:
+        raise ValueError("mhc_adapter_projected_init_floor must be > 0")
+
     adapted = {k: v.clone() for k, v in target_state.items()}
     copied_equal = 0
     copied_adapted = 0
@@ -311,7 +337,16 @@ def adapt_mhc_4_to_n_state_dict(
 
             new[:base_streams, :new_views].copy_(old[:base_streams, :old_views])
             new[base_streams:, :new_views] = inactive_logit
-            new[:base_streams, new_views:new_views + base_streams].copy_(old[:base_streams, old_views:])
+            old_h_res = old[:base_streams, old_views:]
+            if h_res_init_mode == "sinkhorn_projected_log":
+                projected_h_res = sinkhorn_knopps(
+                    old_h_res.to(dtype=new.dtype),
+                    iters=projected_init_iters,
+                )
+                projected_h_res = projected_h_res.clamp_min(projected_init_floor).log()
+                new[:base_streams, new_views:new_views + base_streams].copy_(projected_h_res)
+            else:
+                new[:base_streams, new_views:new_views + base_streams].copy_(old_h_res)
             new[:base_streams, new_views + base_streams:] = cross_logit
             new[base_streams:, new_views:new_views + base_streams] = cross_logit
             new[base_streams:, new_views + base_streams:] = new_block_logit
@@ -371,6 +406,39 @@ def adapt_mhc_4_to_n_state_dict(
     print(f"mHC adapter copied {copied_equal} same-shape tensors and adapted {copied_adapted} tensors")
     return adapted
 
+def get_checkpoint_lr(checkpoint):
+    optimizer_state = checkpoint.get('optimizer')
+    if isinstance(optimizer_state, dict):
+        param_groups = optimizer_state.get('param_groups', [])
+        lrs = [
+            float(group['lr'])
+            for group in param_groups
+            if isinstance(group, dict) and 'lr' in group
+        ]
+        if lrs:
+            return lrs[0]
+
+    ckpt_config = checkpoint.get('config', {})
+    ckpt_iter = checkpoint.get('iter_num', 0)
+    ckpt_learning_rate = float(ckpt_config.get('learning_rate', learning_rate))
+    ckpt_min_lr = float(ckpt_config.get('min_lr', min_lr))
+    ckpt_decay_lr = bool(ckpt_config.get('decay_lr', decay_lr))
+    ckpt_warmup_iters = int(ckpt_config.get('warmup_iters', warmup_iters))
+    ckpt_lr_decay_iters = int(ckpt_config.get('lr_decay_iters', lr_decay_iters))
+
+    if not ckpt_decay_lr:
+        return ckpt_learning_rate
+    if ckpt_iter < ckpt_warmup_iters:
+        return ckpt_learning_rate * (ckpt_iter + 1) / (ckpt_warmup_iters + 1)
+    if ckpt_iter > ckpt_lr_decay_iters:
+        return ckpt_min_lr
+    decay_span = ckpt_lr_decay_iters - ckpt_warmup_iters
+    if decay_span <= 0:
+        return ckpt_min_lr
+    decay_ratio = (ckpt_iter - ckpt_warmup_iters) / decay_span
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return ckpt_min_lr + coeff * (ckpt_learning_rate - ckpt_min_lr)
+
 if master_process:
     print ("="*100)
     for k, v in model_args.items():
@@ -403,6 +471,42 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+elif init_from == 'continue_ckpt':
+    print(f"Continuing training from checkpoint {continue_ckpt_path}")
+    checkpoint = torch.load(continue_ckpt_path, map_location=device)
+    checkpoint_model_args = checkpoint['model_args']
+    for k in model_args:
+        if k in checkpoint_model_args:
+            model_args[k] = checkpoint_model_args[k]
+
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+    state_dict = strip_compile_prefix(checkpoint['model'])
+    model.load_state_dict(state_dict)
+
+    loaded_best_val_loss = checkpoint.get('best_val_loss', 1e9)
+    if loaded_best_val_loss is None:
+        loaded_best_val_loss = 1e9
+    iter_num = 0 if continue_reset_iter else checkpoint.get('iter_num', 0)
+    best_val_loss = 1e9 if continue_reset_best_val_loss else loaded_best_val_loss
+    if continue_fixed_lr_from_ckpt:
+        checkpoint_lr = get_checkpoint_lr(checkpoint)
+        learning_rate = checkpoint_lr
+        min_lr = checkpoint_lr
+        decay_lr = False
+        config.update({
+            'learning_rate': learning_rate,
+            'min_lr': min_lr,
+            'decay_lr': decay_lr,
+        })
+        if master_process:
+            print(f"Freezing learning rate at checkpoint lr: {checkpoint_lr:.8g}")
+            if wandb_log:
+                wandb.config.update({
+                    'learning_rate': learning_rate,
+                    'min_lr': min_lr,
+                    'decay_lr': decay_lr,
+                }, allow_val_change=True)
 elif init_from == 'mhc_adapter':
     print(f"Initializing mHC adapter from {mhc_adapter_ckpt_path}")
     if hyper_conn_type != "mhc":
@@ -432,6 +536,9 @@ elif init_from == 'mhc_adapter':
         cross_logit=mhc_adapter_cross_logit,
         new_block_logit=mhc_adapter_new_block_logit,
         inactive_logit=mhc_adapter_inactive_logit,
+        h_res_init_mode=mhc_adapter_h_res_init_mode,
+        projected_init_iters=mhc_adapter_projected_init_iters,
+        projected_init_floor=mhc_adapter_projected_init_floor,
     )
     model.load_state_dict(adapted_state)
     iter_num = 0
@@ -457,6 +564,12 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
+elif init_from == 'continue_ckpt' and continue_load_optimizer:
+    if 'optimizer' not in checkpoint:
+        raise ValueError("continue_load_optimizer=True but checkpoint has no optimizer state")
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = learning_rate
 checkpoint = None # free up memory
 
 # compile the model
