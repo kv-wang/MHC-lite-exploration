@@ -48,7 +48,7 @@ hyper_conn_expand_stream_mode = "repeat" # "repeat", "split", or "repeat_base_ze
 mhc_gate_fn = "sigmoid"    # "softmax" or "sigmoid" for H_pre/H_post (mhc/mhc_lite only)
 mhc_zero_init_pre_post_logits = False # True = initialize H_pre/H_post static logits to all zeros (mhc only)
 mhc_identity_h_res = False # True = H_res fixed to I, no stream mixing (mhc/mhc_lite only)
-mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
+mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "admm_reverse_kl", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
 mhc_admm_iters = 20        # ADMM steps for H_res when mhc_h_res_mode uses ADMM
 mhc_admm_rho = 1.0         # ADMM penalty for H_res when mhc_h_res_mode uses ADMM
 mhc_adapter_ckpt_path = "out-owt-medium-mhc-num-streams-4/ckpt.pt"
@@ -210,7 +210,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 if dataset == 'openwebtext':
-    data_dir = '/root/autodl-tmp/nanoMoE-mhc/data/openwebtext'
+    data_dir = '/root/autodl-tmp/MHC-backup-20260413-023555/examples/nanogpt/data/openwebtext'
 else:
     data_dir = os.path.join('data', dataset)
 

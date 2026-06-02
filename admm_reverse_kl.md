@@ -1,0 +1,115 @@
+# admm\_reverse\_kl
+
+设 raw logits 为L
+
+$K_{ij}=\operatorname{softplus}(L_{ij})+\epsilon$
+
+其中$\operatorname{softplus}(x)=\log(1+\exp(x))$
+
+goal：$\min_X D_{\mathrm{KL}}(K\|X)$
+
+也就是：
+
+$$
+\sum_{i,j}
+\left[
+K_{ij}\log\frac{K_{ij}}{X_{ij}}
+-
+K_{ij}
++
+X_{ij}
+\right]
+$$
+
+约束是：
+
+$X_{ij}\ge 0$
+
+$\sum_j X_{ij}=1,\quad \forall i$
+
+$\sum_i X_{ij}=1,\quad \forall j$
+
+\*\*ADMM \*\*
+
+把问题写成：
+
+$$
+D_{\mathrm{KL}}(K\|X)
++
+I_{\mathcal{R}}(Y)
++
+I_{\mathcal{C}}(Z)
+$$
+
+subject to：
+
+$X=Y,\qquad X=Z$
+
+**ADMM 迭代**
+
+初始化：
+
+$X^0=K$
+
+$Y^0=\Pi_{\mathcal{R}}(X^0)$
+
+$Z^0=\Pi_{\mathcal{C}}(X^0)$
+
+$U^0=0,\qquad V^0=0$是 scaled dual variables。
+
+for i in range T（25）：
+
+每轮 ADMM：
+
+$Q^t=\frac{1}{2}(Y^t-U^t+Z^t-V^t)$
+
+然后做$X$-update：
+
+$$
+X^{t+1}
+=  \arg\min_X
+D_{\mathrm{KL}}(K\|X)
++
+\frac{\rho}{2}\|X-Y^t+U^t\|_F^2
++
+\frac{\rho}{2}\|X-Z^t+V^t\|_F^2
+$$
+
+有闭式解。令：$B_{ij}=1-2\rho Q^t_{ij}$
+
+则：
+
+$$
+X^{t+1}_{ij}
+=  \frac{
+-B_{ij}
++
+\sqrt{B_{ij}^2+8\rho K_{ij}}
+}
+{4\rho}
+$$
+
+然后做 row projection：
+
+$$
+Y^{t+1}
+=  \Pi_{\mathcal{R}}(X^{t+1}+U^t)
+$$
+
+再做 column projection：
+
+$$
+Z^{t+1}
+=  \Pi_{\mathcal{C}}(X^{t+1}+V^t)
+$$
+
+最后更新 dual variables：
+
+$V^{t+1}=V^t+X^{t+1}-Z^{t+1}$
+
+$U^{t+1}=U^t+X^{t+1}-Y^{t+1}$
+
+$$
+X_{\mathrm{out}}
+=  \frac{1}{2}(Y^T+Z^T)
+$$

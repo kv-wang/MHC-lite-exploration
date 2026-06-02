@@ -136,6 +136,8 @@ def project_cols(x):
 def project_mixed_rows(x, base_streams, cap=1.):
     rows = x.shape[-2]
     base_streams = min(base_streams, rows)
+    if base_streams == rows:
+        return project_simplex(x, dim=-1)
     row_is_base = torch.arange(rows, device=x.device) < base_streams
     row_is_base = row_is_base.view(*((1,) * (x.ndim - 2)), rows, 1)
     equality = project_simplex(x, dim=-1)
@@ -205,6 +207,38 @@ def admm_with_capacity(log_alpha, base_streams, cap=1., iters=20, rho=1.):
         u = u + log_scale - row_dual - col_dual
 
     return (log_alpha + log_scale).exp().to(orig_dtype)
+
+def admm_reverse_kl_with_capacity(log_alpha, base_streams, cap=1., iters=20, rho=1., floor=1e-30):
+    orig_dtype = log_alpha.dtype
+    work_dtype = torch.float32 if orig_dtype in (torch.float16, torch.bfloat16) else orig_dtype
+    log_alpha = log_alpha.to(work_dtype)
+    floor = torch.as_tensor(floor, device=log_alpha.device, dtype=work_dtype)
+    rho = torch.as_tensor(rho, device=log_alpha.device, dtype=work_dtype)
+
+    # Reverse KL needs a positive reference K. X itself is kept nonnegative by
+    # the row / column projections below, not by exponentiating the output.
+    k = F.softplus(log_alpha) + floor
+    x = k
+    y = project_mixed_rows(x, base_streams=base_streams, cap=cap)
+    z = project_mixed_cols(x, base_streams=base_streams, cap=cap)
+    u = torch.zeros_like(x)
+    v = torch.zeros_like(x)
+    tiny = torch.finfo(work_dtype).tiny
+
+    for _ in range(iters):
+        q = 0.5 * (y - u + z - v)
+        b = 1. - 2. * rho * q
+        sqrt_disc = (b.square() + 8. * rho * k).sqrt()
+        direct = (-b + sqrt_disc) / (4. * rho)
+        stable = (2. * k) / (sqrt_disc + b).clamp_min(tiny)
+        x = torch.where(b >= 0., stable, direct)
+
+        y = project_mixed_rows(x + u, base_streams=base_streams, cap=cap)
+        z = project_mixed_cols(x + v, base_streams=base_streams, cap=cap)
+        u = u + x - y
+        v = v + x - z
+
+    return (0.5 * (y + z)).to(orig_dtype)
 
 def cayley_orthogonalize(matrix):
     orig_dtype = matrix.dtype
@@ -407,7 +441,7 @@ class ManifoldConstrainedHyperConnections(Module):
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
         """
         super().__init__()
-        valid_h_res_modes = {"sinkhorn", "admm", "cayley", "adapter_epsilon", "adapter_cap", "adapter_cap_admm"}
+        valid_h_res_modes = {"sinkhorn", "admm", "admm_reverse_kl", "cayley", "adapter_epsilon", "adapter_cap", "adapter_cap_admm"}
         if mhc_h_res_mode not in valid_h_res_modes:
             raise ValueError(f"Invalid mhc_h_res_mode: {mhc_h_res_mode}")
         valid_adapter_admm_input_modes = {"raw_logits", "sinkhorn_base_log"}
@@ -645,6 +679,29 @@ class ManifoldConstrainedHyperConnections(Module):
                 alpha_residual = rearrange(alpha_residual, '... f s g t -> ... f g s t')
                 if self.mhc_h_res_mode == "sinkhorn":
                     alpha_residual = sinkhorn_knopps(alpha_residual, self.sinkhorn_iters)
+                elif self.mhc_h_res_mode == "admm_reverse_kl":
+                    def project_admm_reverse_kl(logits):
+                        return admm_reverse_kl_with_capacity(
+                            logits,
+                            base_streams=streams,
+                            cap=self.mhc_adapter_cap,
+                            iters=self.mhc_admm_iters,
+                            rho=self.mhc_admm_rho,
+                            floor=self.mhc_adapter_admm_input_floor,
+                        )
+
+                    if (
+                        self.mhc_adapter_admm_checkpoint
+                        and torch.is_grad_enabled()
+                        and alpha_residual.requires_grad
+                    ):
+                        alpha_residual = activation_checkpoint(
+                            project_admm_reverse_kl,
+                            alpha_residual,
+                            use_reentrant=False,
+                        )
+                    else:
+                        alpha_residual = project_admm_reverse_kl(alpha_residual)
                 elif self.mhc_h_res_mode == "adapter_epsilon":
                     target = torch.full(
                         (streams,),
