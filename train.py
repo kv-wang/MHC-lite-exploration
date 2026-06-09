@@ -20,6 +20,7 @@ import os
 import time
 import math
 import pickle
+from datetime import timedelta
 from contextlib import nullcontext
 
 import numpy as np
@@ -48,7 +49,7 @@ hyper_conn_expand_stream_mode = "repeat" # "repeat", "split", or "repeat_base_ze
 mhc_gate_fn = "sigmoid"    # "softmax" or "sigmoid" for H_pre/H_post (mhc/mhc_lite only)
 mhc_zero_init_pre_post_logits = False # True = initialize H_pre/H_post static logits to all zeros (mhc only)
 mhc_identity_h_res = False # True = H_res fixed to I, no stream mixing (mhc/mhc_lite only)
-mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "admm_reverse_kl", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
+mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
 mhc_admm_iters = 20        # ADMM steps for H_res when mhc_h_res_mode uses ADMM
 mhc_admm_rho = 1.0         # ADMM penalty for H_res when mhc_h_res_mode uses ADMM
 mhc_adapter_ckpt_path = "out-owt-medium-mhc-num-streams-4/ckpt.pt"
@@ -165,7 +166,8 @@ config = {k: globals()[k] for k in config_keys}
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
-    init_process_group(backend=backend)
+    ddp_timeout_seconds = int(os.environ.get('DDP_TIMEOUT', '1800'))
+    init_process_group(backend=backend, timeout=timedelta(seconds=ddp_timeout_seconds))
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
@@ -850,53 +852,54 @@ while True:
         param_group['lr'] = lr
 
     # evaluate
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 0:
         losses, layer_cosine = estimate_loss()
         avg_train_loss = [np.mean(train_losses), np.std(train_losses)] if len(train_losses) > 0 else [0, 0]
         avg_grad_norm_val = [np.mean(grad_norms), np.std(grad_norms)] if len(grad_norms) > 0 else [0, 0]
 
-        desc = f"[step {iter_num}]" + ", ".join([
-            f"train loss: {losses['train']:.4f}",
-            f"val loss: {losses['val']:.4f}",
-            f"(avg train loss: {avg_train_loss[0]:.4f} ± {avg_train_loss[1]:.4f})",
-            f"(avg grad norm: {avg_grad_norm_val[0]:.4f} ± {avg_grad_norm_val[1]:.4f})",
-        ])
-        print(desc)
+        if master_process:
+            desc = f"[step {iter_num}]" + ", ".join([
+                f"train loss: {losses['train']:.4f}",
+                f"val loss: {losses['val']:.4f}",
+                f"(avg train loss: {avg_train_loss[0]:.4f} ± {avg_train_loss[1]:.4f})",
+                f"(avg grad norm: {avg_grad_norm_val[0]:.4f} ± {avg_grad_norm_val[1]:.4f})",
+            ])
+            print(desc)
 
-        if wandb_log:
-            eval_log = {
-                "iter": iter_num,
-                "train/loss_est": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu * 100,
-                "train/avg_loss": avg_train_loss[0],
-                "train/avg_gnorm": avg_grad_norm_val[0],
-            }
-            wandb.log(eval_log, step=iter_num)
-            if wandb_log_layer_cosine and layer_cosine is not None:
-                layer_table = wandb.Table(columns=["layer", "cosine"])
-                for idx, value in enumerate(layer_cosine):
-                    layer_table.add_data(idx, value)
-                wandb.log({"hc/layer_cosine": layer_table}, step=iter_num)
-            if wandb_log_layer_stats and _has_hc_modules:
-                layer_stats = collect_hc_layer_stats()
-                layer_stats_table = build_layer_table(layer_stats)
-                if layer_stats_table is not None:
-                    wandb.log({"hc/layer_stats": layer_stats_table}, step=iter_num)
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
+            if wandb_log:
+                eval_log = {
+                    "iter": iter_num,
+                    "train/loss_est": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr,
+                    "mfu": running_mfu * 100,
+                    "train/avg_loss": avg_train_loss[0],
+                    "train/avg_gnorm": avg_grad_norm_val[0],
                 }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                wandb.log(eval_log, step=iter_num)
+                if wandb_log_layer_cosine and layer_cosine is not None:
+                    layer_table = wandb.Table(columns=["layer", "cosine"])
+                    for idx, value in enumerate(layer_cosine):
+                        layer_table.add_data(idx, value)
+                    wandb.log({"hc/layer_cosine": layer_table}, step=iter_num)
+                if wandb_log_layer_stats and _has_hc_modules:
+                    layer_stats = collect_hc_layer_stats()
+                    layer_stats_table = build_layer_table(layer_stats)
+                    if layer_stats_table is not None:
+                        wandb.log({"hc/layer_stats": layer_stats_table}, step=iter_num)
+            if losses['val'] < best_val_loss or always_save_checkpoint:
+                best_val_loss = losses['val']
+                if iter_num > 0:
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': config,
+                    }
+                    print(f"saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
 
