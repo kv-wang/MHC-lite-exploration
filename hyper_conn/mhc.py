@@ -41,6 +41,15 @@ def identity(t):
 def add(x, y):
     return x + y
 
+
+class Scale(Module):
+    def __init__(self, scale):
+        super().__init__()
+        self.register_buffer("scale", torch.as_tensor(scale))
+
+    def forward(self, residuals):
+        return residuals * self.scale.to(device=residuals.device, dtype=residuals.dtype)
+
 # sinkhorn
 
 def l1norm(t, dim):
@@ -232,7 +241,18 @@ def admm_reverse_kl_with_capacity(log_alpha, base_streams, cap=1., iters=20, rho
 
     return (0.5 * (y + z)).to(orig_dtype)
 
-def admm_reverse_kl_sprox_alm_with_capacity(log_alpha, base_streams, cap=1., iters=20, rho=1., floor=1e-30):
+def admm_reverse_kl_sprox_alm_with_capacity(
+    log_alpha,
+    base_streams,
+    cap=1.,
+    iters=20,
+    rho=1.,
+    floor=1e-30,
+    dual_step=0.5,
+    prox_weight=None,
+    smooth_beta=0.5,
+    step_scale=1.,
+):
     orig_dtype = log_alpha.dtype
     work_dtype = torch.float32 if orig_dtype in (torch.float16, torch.bfloat16) else orig_dtype
     log_alpha = log_alpha.to(work_dtype)
@@ -252,9 +272,10 @@ def admm_reverse_kl_sprox_alm_with_capacity(log_alpha, base_streams, cap=1., ite
     z_aux = x
     row_eq_dual = torch.zeros_like(x.sum(dim=-1, keepdim=True))
     col_eq_dual = torch.zeros_like(x.sum(dim=-2, keepdim=True))
-    dual_step = torch.full((), 0.5, device=log_alpha.device, dtype=work_dtype)
-    prox_weight = rho
-    smooth_beta = 0.5
+    dual_step = torch.as_tensor(dual_step, device=log_alpha.device, dtype=work_dtype)
+    prox_weight = rho if prox_weight is None else torch.as_tensor(prox_weight, device=log_alpha.device, dtype=work_dtype)
+    smooth_beta = torch.as_tensor(smooth_beta, device=log_alpha.device, dtype=work_dtype)
+    step_scale = torch.as_tensor(step_scale, device=log_alpha.device, dtype=work_dtype)
     smooth_floor = torch.maximum(floor, torch.as_tensor(1e-8, device=log_alpha.device, dtype=work_dtype))
     x = x.clamp_min(smooth_floor)
 
@@ -273,7 +294,7 @@ def admm_reverse_kl_sprox_alm_with_capacity(log_alpha, base_streams, cap=1., ite
         grad = grad + row_term + col_term + prox_weight * (x - z_aux)
 
         local_lip = (k / x_safe.square()).clamp_min(1.)
-        step_size = 1. / (local_lip + rho * (rows + cols) + prox_weight)
+        step_size = step_scale / (local_lip + rho * (rows + cols) + prox_weight)
         next_x = (x - step_size * grad).clamp_min(smooth_floor)
         z_aux = z_aux + smooth_beta * (next_x - z_aux)
         x = next_x
@@ -327,7 +348,7 @@ def get_expand_reduce_stream_functions(
     if num_streams == 1 or disable:
         return (nn.Identity(), nn.Identity())
 
-    if reduce_stream_mode not in {"sum", "mean"}:
+    if reduce_stream_mode not in {"sum", "mean", "4mean"}:
         raise ValueError(f"Invalid reduce_stream_mode: {reduce_stream_mode}")
     if expand_stream_mode not in {"repeat", "split", "repeat_base_zero_rest"}:
         raise ValueError(f"Invalid expand_stream_mode: {expand_stream_mode}")
@@ -349,7 +370,13 @@ def get_expand_reduce_stream_functions(
             active_streams = expand_active_streams,
         )
 
-    reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = reduce_stream_mode, s = num_streams)
+    if reduce_stream_mode == "4mean":
+        reduce_fn = Sequential(
+            Reduce(pattern='(b s) ... -> b ...', reduction='mean', s=num_streams),
+            Scale(4.),
+        )
+    else:
+        reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = reduce_stream_mode, s = num_streams)
 
     return expand_fn, reduce_fn
 
@@ -493,6 +520,10 @@ class ManifoldConstrainedHyperConnections(Module):
         mhc_h_res_mode = "sinkhorn",
         mhc_admm_iters = 20,
         mhc_admm_rho = 1.,
+        mhc_admm_dual_step = 0.5,
+        mhc_admm_prox_weight = None,
+        mhc_admm_smooth_beta = 0.5,
+        mhc_admm_step_scale = 1.,
         mhc_adapter_base_streams = 4,
         mhc_adapter_epsilon = 0.1,
         mhc_adapter_cap = 1.,
@@ -504,7 +535,7 @@ class ManifoldConstrainedHyperConnections(Module):
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
         """
         super().__init__()
-        valid_h_res_modes = {"sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "cayley", "adapter_epsilon", "adapter_cap", "adapter_cap_admm"}
+        valid_h_res_modes = {"sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "alm_signed", "alm_nonnegative", "alm_signed_sprox", "cayley", "adapter_epsilon", "adapter_cap", "adapter_cap_admm"}
         if mhc_h_res_mode not in valid_h_res_modes:
             raise ValueError(f"Invalid mhc_h_res_mode: {mhc_h_res_mode}")
         valid_adapter_admm_input_modes = {"raw_logits", "sinkhorn_base_log"}
@@ -514,6 +545,14 @@ class ManifoldConstrainedHyperConnections(Module):
             raise ValueError("mhc_admm_iters must be >= 1")
         if mhc_admm_rho <= 0:
             raise ValueError("mhc_admm_rho must be > 0")
+        if mhc_admm_dual_step <= 0:
+            raise ValueError("mhc_admm_dual_step must be > 0")
+        if mhc_admm_prox_weight is not None and mhc_admm_prox_weight < 0:
+            raise ValueError("mhc_admm_prox_weight must be >= 0 when set")
+        if mhc_admm_smooth_beta <= 0:
+            raise ValueError("mhc_admm_smooth_beta must be > 0")
+        if mhc_admm_step_scale <= 0:
+            raise ValueError("mhc_admm_step_scale must be > 0")
         if mhc_adapter_base_streams < 1:
             raise ValueError("mhc_adapter_base_streams must be >= 1")
         if mhc_adapter_epsilon <= 0:
@@ -567,8 +606,12 @@ class ManifoldConstrainedHyperConnections(Module):
         else:
             init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
             init_alpha0[init_residual_index, :] = 1.
-        init_alpha1 = torch.ones((num_residual_streams_fracs, num_residual_streams_fracs)) * -8
-        init_alpha1.fill_diagonal_(0.)
+        if mhc_h_res_mode in {"alm_signed", "alm_nonnegative", "alm_signed_sprox"}:
+            init_alpha1 = torch.zeros((num_residual_streams_fracs, num_residual_streams_fracs))
+            init_alpha1.fill_diagonal_(1.)
+        else:
+            init_alpha1 = torch.ones((num_residual_streams_fracs, num_residual_streams_fracs)) * -8
+            init_alpha1.fill_diagonal_(0.)
         self.static_alpha = nn.Parameter(cat((init_alpha0, init_alpha1), dim = 1))
 
         # ------
@@ -618,12 +661,30 @@ class ManifoldConstrainedHyperConnections(Module):
         self.mhc_h_res_mode = mhc_h_res_mode
         self.mhc_admm_iters = mhc_admm_iters
         self.mhc_admm_rho = mhc_admm_rho
+        self.mhc_admm_dual_step = mhc_admm_dual_step
+        self.mhc_admm_prox_weight = mhc_admm_prox_weight
+        self.mhc_admm_smooth_beta = mhc_admm_smooth_beta
+        self.mhc_admm_step_scale = mhc_admm_step_scale
         self.mhc_adapter_base_streams = mhc_adapter_base_streams
         self.mhc_adapter_epsilon = mhc_adapter_epsilon
         self.mhc_adapter_cap = mhc_adapter_cap
         self.mhc_adapter_admm_input_mode = mhc_adapter_admm_input_mode
         self.mhc_adapter_admm_input_floor = mhc_adapter_admm_input_floor
         self.mhc_adapter_admm_checkpoint = mhc_adapter_admm_checkpoint
+        self.collect_h_res_constraint_errors = False
+        self.reset_h_res_constraint_errors()
+
+        h_res_shape = (num_residual_streams_fracs, num_residual_streams_fracs)
+        h_res_alm_row_dual = torch.zeros(num_residual_streams_fracs, 1)
+        h_res_alm_col_dual = torch.zeros(1, num_residual_streams_fracs)
+        h_res_alm_nonneg_dual = torch.zeros(h_res_shape)
+        h_res_sprox_z = torch.eye(num_residual_streams_fracs)
+        self.register_buffer("h_res_alm_row_dual", h_res_alm_row_dual)
+        self.register_buffer("h_res_alm_col_dual", h_res_alm_col_dual)
+        self.register_buffer("h_res_alm_nonneg_dual", h_res_alm_nonneg_dual)
+        self.register_buffer("h_res_sprox_z", h_res_sprox_z)
+        self.reset_h_res_alm_forward_loss()
+        self.reset_h_res_alm_dual_update_accumulators()
 
         # dropouts
 
@@ -642,6 +703,249 @@ class ManifoldConstrainedHyperConnections(Module):
         # needed for memory lanes a la RMT / LMM
 
         self.depth_residual_fn = depth_residual_fn
+
+    def reset_h_res_constraint_errors(self):
+        self._h_res_constraint_count = 0
+        self._h_res_row_err_sum = 0.
+        self._h_res_col_err_sum = 0.
+        self._h_res_nonneg_violation_sum = 0.
+        self._h_res_row_err_max = 0.
+        self._h_res_col_err_max = 0.
+        self._h_res_nonneg_violation_max = 0.
+
+    def _record_h_res_constraint_errors(self, alpha_residual):
+        if not self.collect_h_res_constraint_errors:
+            return
+
+        with torch.no_grad():
+            matrix = alpha_residual.detach().float()
+            row_err = (matrix.sum(dim=-1) - 1.).abs().amax().item()
+            col_err = (matrix.sum(dim=-2) - 1.).abs().amax().item()
+            if self.mhc_h_res_mode == "alm_signed_sprox":
+                nonneg_violation = 0.
+            else:
+                nonneg_violation = (-matrix).clamp_min(0.).amax().item()
+
+        self._h_res_constraint_count += 1
+        self._h_res_row_err_sum += row_err
+        self._h_res_col_err_sum += col_err
+        self._h_res_nonneg_violation_sum += nonneg_violation
+        self._h_res_row_err_max = max(self._h_res_row_err_max, row_err)
+        self._h_res_col_err_max = max(self._h_res_col_err_max, col_err)
+        self._h_res_nonneg_violation_max = max(self._h_res_nonneg_violation_max, nonneg_violation)
+
+    def get_h_res_constraint_errors(self):
+        count = self._h_res_constraint_count
+        if count <= 0:
+            return None
+
+        return {
+            "row_err_mean": self._h_res_row_err_sum / count,
+            "col_err_mean": self._h_res_col_err_sum / count,
+            "nonneg_violation_mean": self._h_res_nonneg_violation_sum / count,
+            "row_err_max": self._h_res_row_err_max,
+            "col_err_max": self._h_res_col_err_max,
+            "nonneg_violation_max": self._h_res_nonneg_violation_max,
+            "count": count,
+        }
+
+    def reset_h_res_alm_forward_loss(self):
+        self._h_res_alm_loss = None
+        self._h_res_sprox_lm_grad_norm = None
+
+    def get_h_res_alm_loss(self):
+        return self._h_res_alm_loss
+
+    def static_h_res(self):
+        return self.static_alpha[:, self.num_input_views:]
+
+    def reset_h_res_alm_dual_update_accumulators(self):
+        self._h_res_alm_update_count = 0
+        self._h_res_alm_row_res_sum = torch.zeros_like(self.h_res_alm_row_dual)
+        self._h_res_alm_col_res_sum = torch.zeros_like(self.h_res_alm_col_dual)
+        self._h_res_alm_nonneg_res_sum = torch.zeros_like(self.h_res_alm_nonneg_dual)
+
+    def _ensure_h_res_alm_accumulators_on_buffer_device(self):
+        if (
+            self._h_res_alm_row_res_sum.device != self.h_res_alm_row_dual.device
+            or self._h_res_alm_col_res_sum.device != self.h_res_alm_col_dual.device
+            or self._h_res_alm_nonneg_res_sum.device != self.h_res_alm_nonneg_dual.device
+        ):
+            self.reset_h_res_alm_dual_update_accumulators()
+
+    def _mean_over_sample_dims(self, tensor, target_ndim):
+        sample_ndim = tensor.ndim - target_ndim
+        if sample_ndim <= 0:
+            return tensor
+        return tensor.mean(dim=tuple(range(sample_ndim)))
+
+    def apply_h_res_alm_loss(self, alpha_residual):
+        rows = alpha_residual.shape[-2]
+        cols = alpha_residual.shape[-1]
+        row_targets = torch.ones(
+            *([1] * (alpha_residual.ndim - 2)),
+            rows,
+            1,
+            device=alpha_residual.device,
+            dtype=alpha_residual.dtype,
+        )
+        col_targets = torch.ones(
+            *([1] * (alpha_residual.ndim - 2)),
+            1,
+            cols,
+            device=alpha_residual.device,
+            dtype=alpha_residual.dtype,
+        )
+
+        row_res = alpha_residual.sum(dim=-1, keepdim=True) - row_targets
+        col_res = alpha_residual.sum(dim=-2, keepdim=True) - col_targets
+        nonneg_res = (-alpha_residual).clamp_min(0.)
+        dual_target_ndim = self.h_res_alm_row_dual.ndim
+        row_res_mean = self._mean_over_sample_dims(row_res, dual_target_ndim)
+        col_res_mean = self._mean_over_sample_dims(col_res, dual_target_ndim)
+        nonneg_res_mean = self._mean_over_sample_dims(nonneg_res, dual_target_ndim)
+        row_res_square_mean = self._mean_over_sample_dims(row_res.square(), dual_target_ndim)
+        col_res_square_mean = self._mean_over_sample_dims(col_res.square(), dual_target_ndim)
+        nonneg_res_square_mean = self._mean_over_sample_dims(nonneg_res.square(), dual_target_ndim)
+
+        row_dual = self.h_res_alm_row_dual.to(device=alpha_residual.device, dtype=alpha_residual.dtype)
+        col_dual = self.h_res_alm_col_dual.to(device=alpha_residual.device, dtype=alpha_residual.dtype)
+        nonneg_dual = self.h_res_alm_nonneg_dual.to(device=alpha_residual.device, dtype=alpha_residual.dtype)
+        rho = torch.as_tensor(self.mhc_admm_rho, device=alpha_residual.device, dtype=alpha_residual.dtype)
+
+        dual_loss = (
+            (row_dual * row_res_mean).sum()
+            + (col_dual * col_res_mean).sum()
+            + (nonneg_dual * nonneg_res_mean).sum()
+        )
+        penalty_loss = 0.5 * rho * (
+            row_res_square_mean.sum()
+            + col_res_square_mean.sum()
+            + nonneg_res_square_mean.sum()
+        )
+        self._h_res_alm_loss = dual_loss + penalty_loss
+
+        with torch.no_grad():
+            self._ensure_h_res_alm_accumulators_on_buffer_device()
+            self._h_res_alm_row_res_sum = self._h_res_alm_row_res_sum + row_res_mean.detach().to(
+                device=self.h_res_alm_row_dual.device,
+                dtype=self.h_res_alm_row_dual.dtype,
+            )
+            self._h_res_alm_col_res_sum = self._h_res_alm_col_res_sum + col_res_mean.detach().to(
+                device=self.h_res_alm_col_dual.device,
+                dtype=self.h_res_alm_col_dual.dtype,
+            )
+            self._h_res_alm_nonneg_res_sum = self._h_res_alm_nonneg_res_sum + nonneg_res_mean.detach().to(
+                device=self.h_res_alm_nonneg_dual.device,
+                dtype=self.h_res_alm_nonneg_dual.dtype,
+            )
+            self._h_res_alm_update_count += 1
+
+        return alpha_residual
+
+    @torch.no_grad()
+    def update_h_res_alm_duals(self):
+        count = self._h_res_alm_update_count
+        if count <= 0:
+            return None
+
+        row_res = self._h_res_alm_row_res_sum / count
+        col_res = self._h_res_alm_col_res_sum / count
+        nonneg_res = self._h_res_alm_nonneg_res_sum / count
+        rho = torch.as_tensor(self.mhc_admm_rho, device=self.h_res_alm_row_dual.device, dtype=self.h_res_alm_row_dual.dtype)
+        self.h_res_alm_row_dual.add_(rho * row_res)
+        self.h_res_alm_col_dual.add_(rho * col_res)
+        self.h_res_alm_nonneg_dual.add_(rho * nonneg_res).clamp_min_(0.)
+
+        stats = {
+            "row_err_max": row_res.abs().amax().item(),
+            "col_err_max": col_res.abs().amax().item(),
+            "nonneg_violation_max": nonneg_res.abs().amax().item(),
+            "row_err_mean": row_res.abs().mean().item(),
+            "col_err_mean": col_res.abs().mean().item(),
+            "nonneg_violation_mean": nonneg_res.abs().mean().item(),
+            "row_dual_norm": torch.linalg.vector_norm(self.h_res_alm_row_dual.float()).item(),
+            "col_dual_norm": torch.linalg.vector_norm(self.h_res_alm_col_dual.float()).item(),
+            "nonneg_dual_norm": torch.linalg.vector_norm(self.h_res_alm_nonneg_dual.float()).item(),
+            "count": count,
+        }
+        self.reset_h_res_alm_dual_update_accumulators()
+        return stats
+
+    def prepare_h_res_sprox_step(self):
+        if self.static_alpha.grad is None:
+            self._h_res_sprox_grad = torch.zeros_like(self.static_h_res())
+        else:
+            self._h_res_sprox_grad = self.static_alpha.grad[:, self.num_input_views:].detach().clone()
+            self.static_alpha.grad[:, self.num_input_views:].zero_()
+        self._h_res_sprox_x = self.static_h_res().detach().clone()
+        self._h_res_sprox_lm_grad_norm = torch.linalg.vector_norm(self._h_res_sprox_grad.float()).item()
+
+    @torch.no_grad()
+    def step_h_res_sprox_alm(self):
+        x = getattr(self, "_h_res_sprox_x", None)
+        grad_f = getattr(self, "_h_res_sprox_grad", None)
+        if x is None or grad_f is None:
+            return None
+
+        x = x.to(device=self.static_alpha.device, dtype=self.static_alpha.dtype)
+        grad_f = grad_f.to(device=self.static_alpha.device, dtype=self.static_alpha.dtype)
+        if self.h_res_sprox_z.device != self.static_alpha.device:
+            self.h_res_sprox_z = self.h_res_sprox_z.to(self.static_alpha.device)
+
+        rho = torch.as_tensor(self.mhc_admm_rho, device=x.device, dtype=x.dtype)
+        dual_step = torch.as_tensor(self.mhc_admm_dual_step, device=x.device, dtype=x.dtype)
+        prox_weight = self.mhc_admm_rho if self.mhc_admm_prox_weight is None else self.mhc_admm_prox_weight
+        prox_weight = torch.as_tensor(prox_weight, device=x.device, dtype=x.dtype)
+        primal_step = torch.as_tensor(self.mhc_admm_step_scale, device=x.device, dtype=x.dtype)
+        smooth_beta = torch.as_tensor(self.mhc_admm_smooth_beta, device=x.device, dtype=x.dtype)
+
+        row_res = x.sum(dim=-1, keepdim=True) - 1.
+        col_res = x.sum(dim=-2, keepdim=True) - 1.
+
+        self.h_res_alm_row_dual.add_(dual_step * row_res.to(self.h_res_alm_row_dual.dtype))
+        self.h_res_alm_col_dual.add_(dual_step * col_res.to(self.h_res_alm_col_dual.dtype))
+
+        row_dual = self.h_res_alm_row_dual.to(device=x.device, dtype=x.dtype)
+        col_dual = self.h_res_alm_col_dual.to(device=x.device, dtype=x.dtype)
+        z = self.h_res_sprox_z.to(device=x.device, dtype=x.dtype)
+
+        grad_k = (
+            grad_f
+            + row_dual
+            + col_dual
+            + rho * (row_res + col_res)
+            + prox_weight * (x - z)
+        )
+        x_next = x - primal_step * grad_k
+        if self.mhc_h_res_mode == "alm_nonnegative":
+            x_next = x_next.clamp_min(0.)
+        self.h_res_sprox_z.lerp_(x_next.to(self.h_res_sprox_z.dtype), smooth_beta.to(self.h_res_sprox_z.dtype))
+        self.static_h_res().copy_(x_next.to(self.static_alpha.dtype))
+
+        next_row_res = x_next.sum(dim=-1, keepdim=True) - 1.
+        next_col_res = x_next.sum(dim=-2, keepdim=True) - 1.
+        if self.mhc_h_res_mode == "alm_nonnegative":
+            nonneg_violation = (-x_next).clamp_min(0.)
+        else:
+            nonneg_violation = torch.zeros_like(x_next)
+
+        stats = {
+            "row_err_max": next_row_res.abs().amax().item(),
+            "col_err_max": next_col_res.abs().amax().item(),
+            "nonneg_violation_max": nonneg_violation.amax().item(),
+            "row_err_mean": next_row_res.abs().mean().item(),
+            "col_err_mean": next_col_res.abs().mean().item(),
+            "nonneg_violation_mean": nonneg_violation.mean().item(),
+            "row_dual_norm": torch.linalg.vector_norm(self.h_res_alm_row_dual.float()).item(),
+            "col_dual_norm": torch.linalg.vector_norm(self.h_res_alm_col_dual.float()).item(),
+            "nonneg_dual_norm": 0.,
+            "lm_grad_norm": self._h_res_sprox_lm_grad_norm or 0.,
+            "count": 1,
+        }
+        self._h_res_sprox_x = None
+        self._h_res_sprox_grad = None
+        return stats
 
     def width_connection(
         self,
@@ -684,6 +988,9 @@ class ManifoldConstrainedHyperConnections(Module):
         alpha_scale      = cat((pre_branch_scale, residual_scale))
 
         dynamic_alpha = wc_weight * alpha_scale
+        if self.mhc_h_res_mode in {"alm_nonnegative", "alm_signed_sprox"}:
+            dynamic_alpha = dynamic_alpha.clone()
+            dynamic_alpha[..., self.num_input_views:] = 0.
 
         static_alpha = rearrange(self.static_alpha, '(f s) t -> f s t', s = streams)
 
@@ -774,6 +1081,10 @@ class ManifoldConstrainedHyperConnections(Module):
                             iters=self.mhc_admm_iters,
                             rho=self.mhc_admm_rho,
                             floor=self.mhc_adapter_admm_input_floor,
+                            dual_step=self.mhc_admm_dual_step,
+                            prox_weight=self.mhc_admm_prox_weight,
+                            smooth_beta=self.mhc_admm_smooth_beta,
+                            step_scale=self.mhc_admm_step_scale,
                         )
 
                     if (
@@ -811,6 +1122,10 @@ class ManifoldConstrainedHyperConnections(Module):
                         )
                     else:
                         alpha_residual = project_admm_l2(alpha_residual)
+                elif self.mhc_h_res_mode == "alm_signed":
+                    alpha_residual = self.apply_h_res_alm_loss(alpha_residual)
+                elif self.mhc_h_res_mode in {"alm_nonnegative", "alm_signed_sprox"}:
+                    pass
                 elif self.mhc_h_res_mode == "adapter_epsilon":
                     target = torch.full(
                         (streams,),
@@ -870,6 +1185,7 @@ class ManifoldConstrainedHyperConnections(Module):
                         iters=self.mhc_admm_iters,
                         rho=self.mhc_admm_rho,
                     )
+                self._record_h_res_constraint_errors(alpha_residual)
                 alpha_residual = rearrange(alpha_residual, '... f g s t -> ... f s g t')
 
         alpha = cat((alpha_pre, alpha_residual), dim = -1) # (..., f, s, f, s+v)

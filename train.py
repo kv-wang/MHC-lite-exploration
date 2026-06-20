@@ -44,14 +44,20 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # ----- hyper conn start -----
 hyper_conn_type = "none" # none, hc, mhc, mhc_lite, attn_res
 hyper_conn_n = 1 # num_streams
-hyper_conn_reduce_stream_mode = "sum" # "sum" or "mean" for final multi-stream reduction
+hyper_conn_reduce_stream_mode = "sum" # "sum", "mean", or "4mean" for final multi-stream reduction
 hyper_conn_expand_stream_mode = "repeat" # "repeat", "split", or "repeat_base_zero_rest" for initial multi-stream expansion
 mhc_gate_fn = "sigmoid"    # "softmax" or "sigmoid" for H_pre/H_post (mhc/mhc_lite only)
 mhc_zero_init_pre_post_logits = False # True = initialize H_pre/H_post static logits to all zeros (mhc only)
 mhc_identity_h_res = False # True = H_res fixed to I, no stream mixing (mhc/mhc_lite only)
-mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
+mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "alm_signed", "alm_nonnegative", "alm_signed_sprox", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
 mhc_admm_iters = 20        # ADMM steps for H_res when mhc_h_res_mode uses ADMM
 mhc_admm_rho = 1.0         # ADMM penalty for H_res when mhc_h_res_mode uses ADMM
+mhc_admm_dual_step = 0.5   # S-prox-ALM dual update step for S-prox H_res modes
+mhc_admm_prox_weight = None # S-prox-ALM proximal weight; None uses mhc_admm_rho
+mhc_admm_smooth_beta = 0.5 # S-prox-ALM auxiliary smoothing factor
+mhc_admm_step_scale = 1.0  # S-prox-ALM primal step multiplier
+mhc_log_constraint_errors = False # log projected H_res row/column constraint errors during training
+mhc_constraint_log_interval = 100 # iteration interval for H_res constraint error logging
 mhc_adapter_ckpt_path = "out-owt-medium-mhc-num-streams-4/ckpt.pt"
 mhc_adapter_base_streams = 4
 mhc_adapter_epsilon = 0.1
@@ -272,6 +278,10 @@ model_args = dict(
     mhc_h_res_mode=mhc_h_res_mode,
     mhc_admm_iters=mhc_admm_iters,
     mhc_admm_rho=mhc_admm_rho,
+    mhc_admm_dual_step=mhc_admm_dual_step,
+    mhc_admm_prox_weight=mhc_admm_prox_weight,
+    mhc_admm_smooth_beta=mhc_admm_smooth_beta,
+    mhc_admm_step_scale=mhc_admm_step_scale,
     mhc_adapter_base_streams=mhc_adapter_base_streams,
     mhc_adapter_epsilon=mhc_adapter_epsilon,
     mhc_adapter_cap=mhc_adapter_cap,
@@ -610,6 +620,188 @@ def _get_hc_modules(block):
 _has_hc_modules = any(
     _get_hc_modules(block)[0] is not None for block in raw_model.transformer.h
 )
+_use_h_res_alm_loss_training = (
+    hyper_conn_type == "mhc"
+    and mhc_h_res_mode == "alm_signed"
+    and _has_hc_modules
+)
+_use_h_res_sprox_training = (
+    hyper_conn_type == "mhc"
+    and mhc_h_res_mode in {"alm_nonnegative", "alm_signed_sprox"}
+    and _has_hc_modules
+)
+
+if mhc_log_constraint_errors and mhc_constraint_log_interval < 1:
+    raise ValueError("mhc_constraint_log_interval must be >= 1")
+
+
+def _iter_hc_modules():
+    for block_idx, block in enumerate(raw_model.transformer.h):
+        hc_attn, hc_mlp = _get_hc_modules(block)
+        if hc_attn is None:
+            continue
+        yield block_idx, "attn", hc_attn
+        yield block_idx, "mlp", hc_mlp
+
+
+def reset_h_res_constraint_errors():
+    for _, _, hc in _iter_hc_modules():
+        if hasattr(hc, "reset_h_res_constraint_errors"):
+            hc.reset_h_res_constraint_errors()
+
+
+def set_h_res_constraint_error_collection(enabled):
+    for _, _, hc in _iter_hc_modules():
+        if hasattr(hc, "collect_h_res_constraint_errors"):
+            hc.collect_h_res_constraint_errors = enabled
+
+
+def collect_h_res_constraint_errors():
+    rows = []
+    for block_idx, component, hc in _iter_hc_modules():
+        if not hasattr(hc, "get_h_res_constraint_errors"):
+            continue
+        stats = hc.get_h_res_constraint_errors()
+        if stats is None:
+            continue
+        layer_index = block_idx * 2 + (0 if component == "attn" else 1)
+        rows.append((layer_index, component, stats))
+    return rows
+
+
+def build_h_res_constraint_error_log(rows):
+    if not rows:
+        return {}
+
+    row_max = max(stats["row_err_max"] for _, _, stats in rows)
+    col_max = max(stats["col_err_max"] for _, _, stats in rows)
+    nonneg_violation_max = max(stats["nonneg_violation_max"] for _, _, stats in rows)
+    row_mean = float(np.mean([stats["row_err_mean"] for _, _, stats in rows]))
+    col_mean = float(np.mean([stats["col_err_mean"] for _, _, stats in rows]))
+    nonneg_violation_mean = float(np.mean([stats["nonneg_violation_mean"] for _, _, stats in rows]))
+    count = sum(stats["count"] for _, _, stats in rows)
+
+    log = {
+        "train/h_res_constraint/row_err_max": row_max,
+        "train/h_res_constraint/col_err_max": col_max,
+        "train/h_res_constraint/nonneg_violation_max": nonneg_violation_max,
+        "train/h_res_constraint/row_err_mean": row_mean,
+        "train/h_res_constraint/col_err_mean": col_mean,
+        "train/h_res_constraint/nonneg_violation_mean": nonneg_violation_mean,
+        "train/h_res_constraint/num_samples": count,
+    }
+    for layer_index, component, stats in rows:
+        key = f"layer_{layer_index}_{component}"
+        log[f"train/h_res_constraint/row_err_max/{key}"] = stats["row_err_max"]
+        log[f"train/h_res_constraint/col_err_max/{key}"] = stats["col_err_max"]
+        log[f"train/h_res_constraint/nonneg_violation_max/{key}"] = stats["nonneg_violation_max"]
+    return log
+
+
+def reset_h_res_alm_forward_losses():
+    for _, _, hc in _iter_hc_modules():
+        if hasattr(hc, "reset_h_res_alm_forward_loss"):
+            hc.reset_h_res_alm_forward_loss()
+
+
+def collect_h_res_alm_loss():
+    total = None
+    for _, _, hc in _iter_hc_modules():
+        if not hasattr(hc, "get_h_res_alm_loss"):
+            continue
+        loss = hc.get_h_res_alm_loss()
+        if loss is None:
+            continue
+        total = loss if total is None else total + loss
+    return total
+
+
+def reset_h_res_alm_dual_update_accumulators():
+    for _, _, hc in _iter_hc_modules():
+        if hasattr(hc, "reset_h_res_alm_dual_update_accumulators"):
+            hc.reset_h_res_alm_dual_update_accumulators()
+
+
+def update_h_res_alm_duals():
+    rows = []
+    for block_idx, component, hc in _iter_hc_modules():
+        if not hasattr(hc, "update_h_res_alm_duals"):
+            continue
+        stats = hc.update_h_res_alm_duals()
+        if stats is None:
+            continue
+        layer_index = block_idx * 2 + (0 if component == "attn" else 1)
+        rows.append((layer_index, component, stats))
+    return rows
+
+
+def prepare_h_res_sprox_steps():
+    for _, _, hc in _iter_hc_modules():
+        if hasattr(hc, "prepare_h_res_sprox_step"):
+            hc.prepare_h_res_sprox_step()
+
+
+def step_h_res_sprox_alm():
+    rows = []
+    for block_idx, component, hc in _iter_hc_modules():
+        if not hasattr(hc, "step_h_res_sprox_alm"):
+            continue
+        stats = hc.step_h_res_sprox_alm()
+        if stats is None:
+            continue
+        layer_index = block_idx * 2 + (0 if component == "attn" else 1)
+        rows.append((layer_index, component, stats))
+    return rows
+
+
+def build_h_res_alm_update_log(rows, alm_loss):
+    if not rows:
+        return {}
+
+    row_err_max = max(stats["row_err_max"] for _, _, stats in rows)
+    col_err_max = max(stats["col_err_max"] for _, _, stats in rows)
+    nonneg_violation_max = max(stats["nonneg_violation_max"] for _, _, stats in rows)
+    row_err_mean = float(np.mean([stats["row_err_mean"] for _, _, stats in rows]))
+    col_err_mean = float(np.mean([stats["col_err_mean"] for _, _, stats in rows]))
+    nonneg_violation_mean = float(np.mean([stats["nonneg_violation_mean"] for _, _, stats in rows]))
+    row_dual_norm_max = max(stats["row_dual_norm"] for _, _, stats in rows)
+    col_dual_norm_max = max(stats["col_dual_norm"] for _, _, stats in rows)
+    nonneg_dual_norm_max = max(stats["nonneg_dual_norm"] for _, _, stats in rows)
+    row_dual_norm_mean = float(np.mean([stats["row_dual_norm"] for _, _, stats in rows]))
+    col_dual_norm_mean = float(np.mean([stats["col_dual_norm"] for _, _, stats in rows]))
+    nonneg_dual_norm_mean = float(np.mean([stats["nonneg_dual_norm"] for _, _, stats in rows]))
+    lm_grad_norm_max = max(stats.get("lm_grad_norm", 0.) for _, _, stats in rows)
+    lm_grad_norm_mean = float(np.mean([stats.get("lm_grad_norm", 0.) for _, _, stats in rows]))
+    count = sum(stats["count"] for _, _, stats in rows)
+
+    log = {
+        "train/h_res_alm/loss": alm_loss,
+        "train/h_res_alm/row_res_max": row_err_max,
+        "train/h_res_alm/col_res_max": col_err_max,
+        "train/h_res_alm/nonneg_violation_max": nonneg_violation_max,
+        "train/h_res_alm/row_res_mean": row_err_mean,
+        "train/h_res_alm/col_res_mean": col_err_mean,
+        "train/h_res_alm/nonneg_violation_mean": nonneg_violation_mean,
+        "train/h_res_alm/row_dual_norm_max": row_dual_norm_max,
+        "train/h_res_alm/col_dual_norm_max": col_dual_norm_max,
+        "train/h_res_alm/nonneg_dual_norm_max": nonneg_dual_norm_max,
+        "train/h_res_alm/lm_grad_norm_max": lm_grad_norm_max,
+        "train/h_res_alm/row_dual_norm_mean": row_dual_norm_mean,
+        "train/h_res_alm/col_dual_norm_mean": col_dual_norm_mean,
+        "train/h_res_alm/nonneg_dual_norm_mean": nonneg_dual_norm_mean,
+        "train/h_res_alm/lm_grad_norm_mean": lm_grad_norm_mean,
+        "train/h_res_alm/num_samples": count,
+    }
+    for layer_index, component, stats in rows:
+        key = f"layer_{layer_index}_{component}"
+        log[f"train/h_res_alm/row_res_max/{key}"] = stats["row_err_max"]
+        log[f"train/h_res_alm/col_res_max/{key}"] = stats["col_err_max"]
+        log[f"train/h_res_alm/nonneg_violation_max/{key}"] = stats["nonneg_violation_max"]
+        log[f"train/h_res_alm/row_dual_norm/{key}"] = stats["row_dual_norm"]
+        log[f"train/h_res_alm/col_dual_norm/{key}"] = stats["col_dual_norm"]
+        log[f"train/h_res_alm/nonneg_dual_norm/{key}"] = stats["nonneg_dual_norm"]
+        log[f"train/h_res_alm/lm_grad_norm/{key}"] = stats.get("lm_grad_norm", 0.)
+    return log
 
 
 def collect_hc_layer_stats():
@@ -903,6 +1095,17 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
+    log_h_res_constraints_this_iter = (
+        mhc_log_constraint_errors
+        and _has_hc_modules
+        and iter_num % mhc_constraint_log_interval == 0
+    )
+    if log_h_res_constraints_this_iter:
+        reset_h_res_constraint_errors()
+        set_h_res_constraint_error_collection(True)
+    if _use_h_res_alm_loss_training:
+        reset_h_res_alm_dual_update_accumulators()
+
     # training step with gradient accumulation
     optimizer.zero_grad(set_to_none=True)
     if wandb_log and (
@@ -912,22 +1115,43 @@ while True:
         reset_layer_activation_norms()
 
     train_time_start = time.time()
+    h_res_alm_loss_accum = 0.
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+        if _use_h_res_alm_loss_training:
+            reset_h_res_alm_forward_losses()
         with ctx:
             logits, loss = model(X, Y)
+            if _use_h_res_alm_loss_training:
+                h_res_alm_loss = collect_h_res_alm_loss()
+                if h_res_alm_loss is not None:
+                    loss = loss + h_res_alm_loss
+                    h_res_alm_loss_accum += h_res_alm_loss.detach().float().item() / gradient_accumulation_steps
             loss = loss / gradient_accumulation_steps
         X, Y = get_batch('train')
         scaler.scale(loss).backward()
+
+    h_res_constraint_errors = None
+    if log_h_res_constraints_this_iter:
+        set_h_res_constraint_error_collection(False)
+        h_res_constraint_errors = collect_h_res_constraint_errors()
 
     # gradient clipping + collect diagnostics
     grad_norm = -1.
     layer_grad_norms = None
     layer_activation_norms = None
     layer_activation_grad_norms = None
-    if grad_clip > 0.:
+    grads_unscaled = False
+    if _use_h_res_sprox_training and scaler.is_enabled():
         scaler.unscale_(optimizer)
+        grads_unscaled = True
+    if _use_h_res_sprox_training:
+        prepare_h_res_sprox_steps()
+    if grad_clip > 0.:
+        if not grads_unscaled:
+            scaler.unscale_(optimizer)
+            grads_unscaled = True
         if wandb_log and wandb_log_layer_activation_norm and _has_hc_modules:
             layer_activation_norms = collect_layer_activation_norms()
         if wandb_log and wandb_log_layer_activation_grad_norm and _has_hc_modules:
@@ -939,12 +1163,49 @@ while True:
 
     scaler.step(optimizer)
     scaler.update()
+    h_res_alm_update_log = None
+    if _use_h_res_alm_loss_training:
+        h_res_alm_update_log = build_h_res_alm_update_log(
+            update_h_res_alm_duals(),
+            h_res_alm_loss_accum,
+        )
+    elif _use_h_res_sprox_training:
+        h_res_alm_update_log = build_h_res_alm_update_log(
+            step_h_res_sprox_alm(),
+            0.,
+        )
     train_time_end = time.time()
     d_train_time = train_time_end - train_time_start
     tokens_per_sec = tokens_per_iter / d_train_time
 
+    if h_res_constraint_errors is not None and master_process:
+        h_res_constraint_log = build_h_res_constraint_error_log(h_res_constraint_errors)
+        if h_res_constraint_log:
+            print(
+                f"[iter {iter_num}] h_res constraint "
+                f"row_err_max: {h_res_constraint_log['train/h_res_constraint/row_err_max']:.6g}, "
+                f"col_err_max: {h_res_constraint_log['train/h_res_constraint/col_err_max']:.6g}, "
+                f"nonneg_violation_max: {h_res_constraint_log['train/h_res_constraint/nonneg_violation_max']:.6g}, "
+                f"row_err_mean: {h_res_constraint_log['train/h_res_constraint/row_err_mean']:.6g}, "
+                f"col_err_mean: {h_res_constraint_log['train/h_res_constraint/col_err_mean']:.6g}, "
+                f"nonneg_violation_mean: {h_res_constraint_log['train/h_res_constraint/nonneg_violation_mean']:.6g}"
+            )
+            if wandb_log:
+                wandb.log(h_res_constraint_log, step=iter_num)
+    if h_res_alm_update_log and master_process and iter_num % log_interval == 0:
+        print(
+            f"[iter {iter_num}] h_res ALM "
+            f"loss: {h_res_alm_update_log['train/h_res_alm/loss']:.6g}, "
+            f"row_res_max: {h_res_alm_update_log['train/h_res_alm/row_res_max']:.6g}, "
+            f"col_res_max: {h_res_alm_update_log['train/h_res_alm/col_res_max']:.6g}, "
+            f"nonneg_violation_max: {h_res_alm_update_log['train/h_res_alm/nonneg_violation_max']:.6g}, "
+            f"row_dual_norm_max: {h_res_alm_update_log['train/h_res_alm/row_dual_norm_max']:.6g}, "
+            f"col_dual_norm_max: {h_res_alm_update_log['train/h_res_alm/col_dual_norm_max']:.6g}, "
+            f"nonneg_dual_norm_max: {h_res_alm_update_log['train/h_res_alm/nonneg_dual_norm_max']:.6g}"
+        )
+
     tpss.append(tokens_per_sec)
-    train_losses.append(float(loss))
+    train_losses.append(float(loss.detach()))
     grad_norms.append(float(grad_norm))
     if len(train_losses) > 200:
         train_losses.pop(0)
@@ -980,6 +1241,8 @@ while True:
                 log_dict["perf/max_mem_allocated_mb"] = (
                     torch.cuda.max_memory_allocated() / 1e6
                 )
+            if h_res_alm_update_log:
+                log_dict.update(h_res_alm_update_log)
             wandb.log(log_dict, step=iter_num)
             if wandb_log_layer_grad_norm and layer_grad_norms is not None:
                 lg = build_layer_scalar_log("train/layer_parameter_grad_norm", layer_grad_norms)
