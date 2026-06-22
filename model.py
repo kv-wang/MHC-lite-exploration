@@ -103,7 +103,9 @@ class Block(nn.Module):
         super().__init__()
         self.init_hc = init_hc
         self.expand_stream = expand_stream
-        self.reduce_stream = reduce_stream
+        # The reducer is applied once at the GPT output. Do not register it on
+        # every block, because some reducers have learnable parameters.
+        self.reduce_stream = None
         self.attn_res_mixer = attn_res_mixer
         self.attn_res_attn_step = step_offset
         self.attn_res_mlp_step = step_offset + 1

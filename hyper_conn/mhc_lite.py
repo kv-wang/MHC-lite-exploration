@@ -52,6 +52,29 @@ def first_tensor(tree):
     raise RuntimeError("Expected at least one tensor in tree output")
 
 
+class Scale(Module):
+    def __init__(self, scale):
+        super().__init__()
+        self.register_buffer("scale", torch.as_tensor(scale))
+
+    def forward(self, residuals):
+        return residuals * self.scale.to(device=residuals.device, dtype=residuals.dtype)
+
+
+class SoftmaxWeightedReduceStreams(Module):
+    def __init__(self, num_streams, scale=4.):
+        super().__init__()
+        self.num_streams = num_streams
+        self.scale = scale
+        self.logits = nn.Parameter(torch.zeros(num_streams))
+
+    def forward(self, residuals):
+        residuals = rearrange(residuals, '(b s) ... -> b s ...', s=self.num_streams)
+        weights = self.logits.softmax(dim=0).to(device=residuals.device, dtype=residuals.dtype)
+        view_shape = (1, self.num_streams) + (1,) * (residuals.ndim - 2)
+        return (residuals * weights.view(view_shape)).sum(dim=1) * self.scale
+
+
 # sinkhorn
 
 def l1norm(t, dim):
@@ -103,7 +126,7 @@ def get_expand_reduce_stream_functions(
     if num_streams == 1 or disable:
         return (nn.Identity(), nn.Identity())
 
-    if reduce_stream_mode not in {"sum", "mean"}:
+    if reduce_stream_mode not in {"sum", "mean", "4mean", "softmax_4mean"}:
         raise ValueError(f"Invalid reduce_stream_mode: {reduce_stream_mode}")
     if expand_stream_mode not in {"repeat", "split"}:
         raise ValueError(f"Invalid expand_stream_mode: {expand_stream_mode}")
@@ -115,7 +138,15 @@ def get_expand_reduce_stream_functions(
     else:
         expand_fn = ExpandStreams(num_streams, mode = expand_stream_mode)
 
-    reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = reduce_stream_mode, s = num_streams)
+    if reduce_stream_mode == "4mean":
+        reduce_fn = Sequential(
+            Reduce(pattern='(b s) ... -> b ...', reduction='mean', s=num_streams),
+            Scale(4.),
+        )
+    elif reduce_stream_mode == "softmax_4mean":
+        reduce_fn = SoftmaxWeightedReduceStreams(num_streams, scale=4.)
+    else:
+        reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = reduce_stream_mode, s = num_streams)
 
     return expand_fn, reduce_fn
 
