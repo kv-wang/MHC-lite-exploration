@@ -48,6 +48,10 @@ common_args=(
   --out_prefix_method="$OUT_PREFIX_METHOD"
   --wandb_log_layer_stats=False
   --wandb_log_layer_cosine=False
+    --wandb_log_layer_grad_norm=False
+    --wandb_log_layer_activation_norm=False
+    --wandb_log_layer_activation_grad_norm=False
+    --mhc_log_constraint_errors=False
 )
 
 if [[ "$N_GPUS" -gt 0 ]]; then

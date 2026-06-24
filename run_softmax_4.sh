@@ -16,14 +16,14 @@ cd "$SCRIPT_DIR"
 export WANDB_API_KEY="${WANDB_API_KEY:-2eaf5d3e15da1d68fbce32137184e1eaba001ff6}"
 export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.bandw.top}"
 
-N_GPUS="${N_GPUS:-4}"
+N_GPUS="${N_GPUS:-1}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-config/train_owt.py}"
-MODEL_CONFIG="${MODEL_CONFIG:-config/small_model.py}"
+MODEL_CONFIG="${MODEL_CONFIG:-config/medium_model.py}"
 METHOD_CONFIG="${METHOD_CONFIG:-config/with_mhc_alm_nonnegative.py}"
 MAX_ITERS="${MAX_ITERS:-10000}"
 EVAL_ITERS="${EVAL_ITERS:-200}"
-WANDB_PROJECT="${WANDB_PROJECT:-ablation_num_streams_small}"
-STREAMS_LIST="${STREAMS_LIST:-32 16 8 4}"
+WANDB_PROJECT="${WANDB_PROJECT:-ablation_num_streams_medium}"
+STREAMS_LIST="${STREAMS_LIST:-32}"
 REDUCE_STREAM_MODE="${REDUCE_STREAM_MODE:-softmax_4mean}"
 
 echo ""
@@ -67,6 +67,10 @@ run_streams() {
     --out_prefix_method="$out_prefix_method"
     --wandb_log_layer_stats=False
     --wandb_log_layer_cosine=False
+    --wandb_log_layer_grad_norm=False
+    --wandb_log_layer_activation_norm=False
+    --wandb_log_layer_activation_grad_norm=False
+    --mhc_log_constraint_errors=False
   )
 
   if [[ "$N_GPUS" -gt 0 ]]; then

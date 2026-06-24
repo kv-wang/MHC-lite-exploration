@@ -88,7 +88,7 @@ eval_interval = 2000
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
+always_save_checkpoint = True # legacy config; checkpoints are saved only once at the final iteration
 init_from = 'scratch' # 'scratch', 'resume', 'continue_ckpt', 'mhc_adapter', or 'gpt2*'
 continue_ckpt_path = "out-owt-medium-mhc-num-streams-4/ckpt.pt"
 continue_load_optimizer = True
@@ -612,6 +612,20 @@ def get_lr(it):
 
 raw_model = model.module if ddp else model
 
+def save_final_checkpoint(saved_iter_num):
+    if not master_process:
+        return
+    checkpoint = {
+        'model': raw_model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'model_args': model_args,
+        'iter_num': saved_iter_num,
+        'best_val_loss': best_val_loss,
+        'config': config,
+    }
+    print(f"saving final checkpoint to {out_dir}")
+    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+
 def _get_hc_modules(block):
     if hasattr(block, 'hc_attn') and hasattr(block, 'hc_mlp'):
         return block.hc_attn, block.hc_mlp
@@ -1079,19 +1093,8 @@ while True:
                     layer_stats_table = build_layer_table(layer_stats)
                     if layer_stats_table is not None:
                         wandb.log({"hc/layer_stats": layer_stats_table}, step=iter_num)
-            if losses['val'] < best_val_loss or always_save_checkpoint:
+            if losses['val'] < best_val_loss:
                 best_val_loss = losses['val']
-                if iter_num > 0:
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': model_args,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                        'config': config,
-                    }
-                    print(f"saving checkpoint to {out_dir}")
-                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
 
@@ -1265,6 +1268,9 @@ while True:
 
     if iter_num > max_iters:
         break
+
+if not eval_only and iter_num > 0:
+    save_final_checkpoint(iter_num - 1)
 
 if ddp:
     destroy_process_group()

@@ -38,6 +38,10 @@ run_one() {
       --wandb_project="$WANDB_PROJECT" \
       --wandb_log_layer_stats=False \
       --wandb_log_layer_cosine=False \
+      --wandb_log_layer_grad_norm=False \
+      --wandb_log_layer_activation_norm=False \
+      --wandb_log_layer_activation_grad_norm=False \
+      --mhc_log_constraint_errors=False \
       ${NUM_STREAMS:+--num_streams="$NUM_STREAMS"} \
       ${EXPAND_STREAM_MODE:+--expand_stream_mode="$EXPAND_STREAM_MODE"} \
       "$@"
@@ -45,6 +49,12 @@ run_one() {
     python train.py \
       "$TRAIN_CONFIG" "$MODEL_CONFIG" \
       --wandb_project="$WANDB_PROJECT" \
+      --wandb_log_layer_stats=False \
+      --wandb_log_layer_cosine=False \
+      --wandb_log_layer_grad_norm=False \
+      --wandb_log_layer_activation_norm=False \
+      --wandb_log_layer_activation_grad_norm=False \
+      --mhc_log_constraint_errors=False \
       ${NUM_STREAMS:+--num_streams="$NUM_STREAMS"} \
       ${EXPAND_STREAM_MODE:+--expand_stream_mode="$EXPAND_STREAM_MODE"} \
       "$@"
