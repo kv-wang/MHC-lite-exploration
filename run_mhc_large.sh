@@ -18,14 +18,14 @@ export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.bandw.top}"
 
 N_GPUS="${N_GPUS:-4}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-config/train_owt.py}"
-MODEL_CONFIG="${MODEL_CONFIG:-config/medium_model.py}"
+MODEL_CONFIG="${MODEL_CONFIG:-config/large_model.py}"
 METHOD_CONFIG="${METHOD_CONFIG:-config/with_mhc.py}"
 MAX_ITERS="${MAX_ITERS:-10000}"
 EVAL_ITERS="${EVAL_ITERS:-200}"
 N_STREAMS="${N_STREAMS:-4}"
-WANDB_PROJECT="${WANDB_PROJECT:-ablation_num_streams_medium}"
+WANDB_PROJECT="${WANDB_PROJECT:-ablation_num_streams_large}"
 
-WANDB_RUN_NAME="mhc-medium-mhc-sinkhorn-${N_STREAMS}streams-${MAX_ITERS}iter"
+WANDB_RUN_NAME="mhc-large-mhc-sinkhorn-${N_STREAMS}streams-${MAX_ITERS}iter"
 OUT_PREFIX_METHOD="mhc-sinkhorn-${N_STREAMS}streams-${MAX_ITERS}iter"
 
 echo ""

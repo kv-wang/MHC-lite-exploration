@@ -348,6 +348,32 @@ def cayley_orthogonalize(matrix):
     orth = torch.linalg.solve(eye - skew, eye + skew)
     return orth.to(orig_dtype)
 
+def project_spectral_residual_sphere(matrix, radius=1.):
+    orig_dtype = matrix.dtype
+    work_dtype = torch.float32 if orig_dtype in (torch.float16, torch.bfloat16) else orig_dtype
+    matrix = matrix.to(work_dtype)
+    rows, cols = matrix.shape[-2:]
+    if rows != cols:
+        raise ValueError(f"spectral H_res projection expects a square matrix, got {tuple(matrix.shape[-2:])}")
+
+    radius = torch.as_tensor(radius, device=matrix.device, dtype=work_dtype)
+    j = torch.full((rows, cols), 1. / rows, device=matrix.device, dtype=work_dtype)
+    j = j.expand(matrix.shape)
+    displacement = matrix - j
+
+    # Orthogonal projection onto {D | D 1 = 0, 1^T D = 0}.
+    displacement = (
+        displacement
+        - displacement.mean(dim=-1, keepdim=True)
+        - displacement.mean(dim=-2, keepdim=True)
+        + displacement.mean(dim=(-2, -1), keepdim=True)
+    )
+
+    u, s, vh = torch.linalg.svd(displacement, full_matrices=False)
+    s = s.clamp(max=radius)
+    projected = (u * s.unsqueeze(-2)) @ vh
+    return (j + projected).to(orig_dtype)
+
 # main functions
 
 def get_expand_reduce_stream_functions(
@@ -551,7 +577,7 @@ class ManifoldConstrainedHyperConnections(Module):
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
         """
         super().__init__()
-        valid_h_res_modes = {"sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "alm_signed", "alm_nonnegative", "alm_signed_sprox", "cayley", "adapter_epsilon", "adapter_cap", "adapter_cap_admm"}
+        valid_h_res_modes = {"sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "alm_signed", "alm_nonnegative", "alm_signed_sprox", "alm_spectral_sprox", "cayley", "adapter_epsilon", "adapter_cap", "adapter_cap_admm"}
         if mhc_h_res_mode not in valid_h_res_modes:
             raise ValueError(f"Invalid mhc_h_res_mode: {mhc_h_res_mode}")
         valid_adapter_admm_input_modes = {"raw_logits", "sinkhorn_base_log"}
@@ -622,7 +648,7 @@ class ManifoldConstrainedHyperConnections(Module):
         else:
             init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
             init_alpha0[init_residual_index, :] = 1.
-        if mhc_h_res_mode in {"alm_signed", "alm_nonnegative", "alm_signed_sprox"}:
+        if mhc_h_res_mode in {"alm_signed", "alm_nonnegative", "alm_signed_sprox", "alm_spectral_sprox"}:
             init_alpha1 = torch.zeros((num_residual_streams_fracs, num_residual_streams_fracs))
             init_alpha1.fill_diagonal_(1.)
         else:
@@ -725,9 +751,11 @@ class ManifoldConstrainedHyperConnections(Module):
         self._h_res_row_err_sum = 0.
         self._h_res_col_err_sum = 0.
         self._h_res_nonneg_violation_sum = 0.
+        self._h_res_spectral_violation_sum = 0.
         self._h_res_row_err_max = 0.
         self._h_res_col_err_max = 0.
         self._h_res_nonneg_violation_max = 0.
+        self._h_res_spectral_violation_max = 0.
 
     def _record_h_res_constraint_errors(self, alpha_residual):
         if not self.collect_h_res_constraint_errors:
@@ -737,18 +765,28 @@ class ManifoldConstrainedHyperConnections(Module):
             matrix = alpha_residual.detach().float()
             row_err = (matrix.sum(dim=-1) - 1.).abs().amax().item()
             col_err = (matrix.sum(dim=-2) - 1.).abs().amax().item()
-            if self.mhc_h_res_mode == "alm_signed_sprox":
+            if self.mhc_h_res_mode in {"alm_signed_sprox", "alm_spectral_sprox"}:
                 nonneg_violation = 0.
             else:
                 nonneg_violation = (-matrix).clamp_min(0.).amax().item()
+            if self.mhc_h_res_mode == "alm_spectral_sprox":
+                n = matrix.shape[-1]
+                j = torch.full_like(matrix, 1. / n)
+                displacement = matrix - j
+                spectral_norm = torch.linalg.matrix_norm(displacement, ord=2).item()
+                spectral_violation = max(0., spectral_norm - 1.)
+            else:
+                spectral_violation = 0.
 
         self._h_res_constraint_count += 1
         self._h_res_row_err_sum += row_err
         self._h_res_col_err_sum += col_err
         self._h_res_nonneg_violation_sum += nonneg_violation
+        self._h_res_spectral_violation_sum += spectral_violation
         self._h_res_row_err_max = max(self._h_res_row_err_max, row_err)
         self._h_res_col_err_max = max(self._h_res_col_err_max, col_err)
         self._h_res_nonneg_violation_max = max(self._h_res_nonneg_violation_max, nonneg_violation)
+        self._h_res_spectral_violation_max = max(self._h_res_spectral_violation_max, spectral_violation)
 
     def get_h_res_constraint_errors(self):
         count = self._h_res_constraint_count
@@ -759,9 +797,11 @@ class ManifoldConstrainedHyperConnections(Module):
             "row_err_mean": self._h_res_row_err_sum / count,
             "col_err_mean": self._h_res_col_err_sum / count,
             "nonneg_violation_mean": self._h_res_nonneg_violation_sum / count,
+            "spectral_violation_mean": self._h_res_spectral_violation_sum / count,
             "row_err_max": self._h_res_row_err_max,
             "col_err_max": self._h_res_col_err_max,
             "nonneg_violation_max": self._h_res_nonneg_violation_max,
+            "spectral_violation_max": self._h_res_spectral_violation_max,
             "count": count,
         }
 
@@ -936,6 +976,8 @@ class ManifoldConstrainedHyperConnections(Module):
         x_next = x - primal_step * grad_k
         if self.mhc_h_res_mode == "alm_nonnegative":
             x_next = x_next.clamp_min(0.)
+        elif self.mhc_h_res_mode == "alm_spectral_sprox":
+            x_next = project_spectral_residual_sphere(x_next, radius=1.)
         self.h_res_sprox_z.lerp_(x_next.to(self.h_res_sprox_z.dtype), smooth_beta.to(self.h_res_sprox_z.dtype))
         self.static_h_res().copy_(x_next.to(self.static_alpha.dtype))
 
@@ -945,14 +987,26 @@ class ManifoldConstrainedHyperConnections(Module):
             nonneg_violation = (-x_next).clamp_min(0.)
         else:
             nonneg_violation = torch.zeros_like(x_next)
+        if self.mhc_h_res_mode == "alm_spectral_sprox":
+            n = x_next.shape[-1]
+            j = torch.full_like(x_next, 1. / n)
+            displacement = x_next - j
+            spectral_norm = torch.linalg.matrix_norm(displacement.float(), ord=2).item()
+            spectral_violation = max(0., spectral_norm - 1.)
+        else:
+            spectral_norm = 0.
+            spectral_violation = 0.
 
         stats = {
             "row_err_max": next_row_res.abs().amax().item(),
             "col_err_max": next_col_res.abs().amax().item(),
             "nonneg_violation_max": nonneg_violation.amax().item(),
+            "spectral_norm": spectral_norm,
+            "spectral_violation_max": spectral_violation,
             "row_err_mean": next_row_res.abs().mean().item(),
             "col_err_mean": next_col_res.abs().mean().item(),
             "nonneg_violation_mean": nonneg_violation.mean().item(),
+            "spectral_violation_mean": spectral_violation,
             "row_dual_norm": torch.linalg.vector_norm(self.h_res_alm_row_dual.float()).item(),
             "col_dual_norm": torch.linalg.vector_norm(self.h_res_alm_col_dual.float()).item(),
             "nonneg_dual_norm": 0.,
@@ -1004,7 +1058,7 @@ class ManifoldConstrainedHyperConnections(Module):
         alpha_scale      = cat((pre_branch_scale, residual_scale))
 
         dynamic_alpha = wc_weight * alpha_scale
-        if self.mhc_h_res_mode in {"alm_nonnegative", "alm_signed_sprox"}:
+        if self.mhc_h_res_mode in {"alm_nonnegative", "alm_signed_sprox", "alm_spectral_sprox"}:
             dynamic_alpha = dynamic_alpha.clone()
             dynamic_alpha[..., self.num_input_views:] = 0.
 
@@ -1140,7 +1194,7 @@ class ManifoldConstrainedHyperConnections(Module):
                         alpha_residual = project_admm_l2(alpha_residual)
                 elif self.mhc_h_res_mode == "alm_signed":
                     alpha_residual = self.apply_h_res_alm_loss(alpha_residual)
-                elif self.mhc_h_res_mode in {"alm_nonnegative", "alm_signed_sprox"}:
+                elif self.mhc_h_res_mode in {"alm_nonnegative", "alm_signed_sprox", "alm_spectral_sprox"}:
                     pass
                 elif self.mhc_h_res_mode == "adapter_epsilon":
                     target = torch.full(

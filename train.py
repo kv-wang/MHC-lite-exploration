@@ -49,7 +49,7 @@ hyper_conn_expand_stream_mode = "repeat" # "repeat", "split", or "repeat_base_ze
 mhc_gate_fn = "sigmoid"    # "softmax" or "sigmoid" for H_pre/H_post (mhc/mhc_lite only)
 mhc_zero_init_pre_post_logits = False # True = initialize H_pre/H_post static logits to all zeros (mhc only)
 mhc_identity_h_res = False # True = H_res fixed to I, no stream mixing (mhc/mhc_lite only)
-mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "alm_signed", "alm_nonnegative", "alm_signed_sprox", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
+mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "alm_signed", "alm_nonnegative", "alm_signed_sprox", "alm_spectral_sprox", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
 mhc_admm_iters = 20        # ADMM steps for H_res when mhc_h_res_mode uses ADMM
 mhc_admm_rho = 1.0         # ADMM penalty for H_res when mhc_h_res_mode uses ADMM
 mhc_admm_dual_step = 0.5   # S-prox-ALM dual update step for S-prox H_res modes
@@ -641,7 +641,7 @@ _use_h_res_alm_loss_training = (
 )
 _use_h_res_sprox_training = (
     hyper_conn_type == "mhc"
-    and mhc_h_res_mode in {"alm_nonnegative", "alm_signed_sprox"}
+    and mhc_h_res_mode in {"alm_nonnegative", "alm_signed_sprox", "alm_spectral_sprox"}
     and _has_hc_modules
 )
 
@@ -690,18 +690,22 @@ def build_h_res_constraint_error_log(rows):
     row_max = max(stats["row_err_max"] for _, _, stats in rows)
     col_max = max(stats["col_err_max"] for _, _, stats in rows)
     nonneg_violation_max = max(stats["nonneg_violation_max"] for _, _, stats in rows)
+    spectral_violation_max = max(stats.get("spectral_violation_max", 0.) for _, _, stats in rows)
     row_mean = float(np.mean([stats["row_err_mean"] for _, _, stats in rows]))
     col_mean = float(np.mean([stats["col_err_mean"] for _, _, stats in rows]))
     nonneg_violation_mean = float(np.mean([stats["nonneg_violation_mean"] for _, _, stats in rows]))
+    spectral_violation_mean = float(np.mean([stats.get("spectral_violation_mean", 0.) for _, _, stats in rows]))
     count = sum(stats["count"] for _, _, stats in rows)
 
     log = {
         "train/h_res_constraint/row_err_max": row_max,
         "train/h_res_constraint/col_err_max": col_max,
         "train/h_res_constraint/nonneg_violation_max": nonneg_violation_max,
+        "train/h_res_constraint/spectral_violation_max": spectral_violation_max,
         "train/h_res_constraint/row_err_mean": row_mean,
         "train/h_res_constraint/col_err_mean": col_mean,
         "train/h_res_constraint/nonneg_violation_mean": nonneg_violation_mean,
+        "train/h_res_constraint/spectral_violation_mean": spectral_violation_mean,
         "train/h_res_constraint/num_samples": count,
     }
     for layer_index, component, stats in rows:
@@ -709,6 +713,7 @@ def build_h_res_constraint_error_log(rows):
         log[f"train/h_res_constraint/row_err_max/{key}"] = stats["row_err_max"]
         log[f"train/h_res_constraint/col_err_max/{key}"] = stats["col_err_max"]
         log[f"train/h_res_constraint/nonneg_violation_max/{key}"] = stats["nonneg_violation_max"]
+        log[f"train/h_res_constraint/spectral_violation_max/{key}"] = stats.get("spectral_violation_max", 0.)
     return log
 
 
@@ -775,9 +780,13 @@ def build_h_res_alm_update_log(rows, alm_loss):
     row_err_max = max(stats["row_err_max"] for _, _, stats in rows)
     col_err_max = max(stats["col_err_max"] for _, _, stats in rows)
     nonneg_violation_max = max(stats["nonneg_violation_max"] for _, _, stats in rows)
+    spectral_violation_max = max(stats.get("spectral_violation_max", 0.) for _, _, stats in rows)
+    spectral_norm_max = max(stats.get("spectral_norm", 0.) for _, _, stats in rows)
     row_err_mean = float(np.mean([stats["row_err_mean"] for _, _, stats in rows]))
     col_err_mean = float(np.mean([stats["col_err_mean"] for _, _, stats in rows]))
     nonneg_violation_mean = float(np.mean([stats["nonneg_violation_mean"] for _, _, stats in rows]))
+    spectral_violation_mean = float(np.mean([stats.get("spectral_violation_mean", 0.) for _, _, stats in rows]))
+    spectral_norm_mean = float(np.mean([stats.get("spectral_norm", 0.) for _, _, stats in rows]))
     row_dual_norm_max = max(stats["row_dual_norm"] for _, _, stats in rows)
     col_dual_norm_max = max(stats["col_dual_norm"] for _, _, stats in rows)
     nonneg_dual_norm_max = max(stats["nonneg_dual_norm"] for _, _, stats in rows)
@@ -793,9 +802,13 @@ def build_h_res_alm_update_log(rows, alm_loss):
         "train/h_res_alm/row_res_max": row_err_max,
         "train/h_res_alm/col_res_max": col_err_max,
         "train/h_res_alm/nonneg_violation_max": nonneg_violation_max,
+        "train/h_res_alm/spectral_violation_max": spectral_violation_max,
+        "train/h_res_alm/spectral_norm_max": spectral_norm_max,
         "train/h_res_alm/row_res_mean": row_err_mean,
         "train/h_res_alm/col_res_mean": col_err_mean,
         "train/h_res_alm/nonneg_violation_mean": nonneg_violation_mean,
+        "train/h_res_alm/spectral_violation_mean": spectral_violation_mean,
+        "train/h_res_alm/spectral_norm_mean": spectral_norm_mean,
         "train/h_res_alm/row_dual_norm_max": row_dual_norm_max,
         "train/h_res_alm/col_dual_norm_max": col_dual_norm_max,
         "train/h_res_alm/nonneg_dual_norm_max": nonneg_dual_norm_max,
@@ -811,6 +824,8 @@ def build_h_res_alm_update_log(rows, alm_loss):
         log[f"train/h_res_alm/row_res_max/{key}"] = stats["row_err_max"]
         log[f"train/h_res_alm/col_res_max/{key}"] = stats["col_err_max"]
         log[f"train/h_res_alm/nonneg_violation_max/{key}"] = stats["nonneg_violation_max"]
+        log[f"train/h_res_alm/spectral_violation_max/{key}"] = stats.get("spectral_violation_max", 0.)
+        log[f"train/h_res_alm/spectral_norm/{key}"] = stats.get("spectral_norm", 0.)
         log[f"train/h_res_alm/row_dual_norm/{key}"] = stats["row_dual_norm"]
         log[f"train/h_res_alm/col_dual_norm/{key}"] = stats["col_dual_norm"]
         log[f"train/h_res_alm/nonneg_dual_norm/{key}"] = stats["nonneg_dual_norm"]
@@ -1189,9 +1204,11 @@ while True:
                 f"row_err_max: {h_res_constraint_log['train/h_res_constraint/row_err_max']:.6g}, "
                 f"col_err_max: {h_res_constraint_log['train/h_res_constraint/col_err_max']:.6g}, "
                 f"nonneg_violation_max: {h_res_constraint_log['train/h_res_constraint/nonneg_violation_max']:.6g}, "
+                f"spectral_violation_max: {h_res_constraint_log['train/h_res_constraint/spectral_violation_max']:.6g}, "
                 f"row_err_mean: {h_res_constraint_log['train/h_res_constraint/row_err_mean']:.6g}, "
                 f"col_err_mean: {h_res_constraint_log['train/h_res_constraint/col_err_mean']:.6g}, "
-                f"nonneg_violation_mean: {h_res_constraint_log['train/h_res_constraint/nonneg_violation_mean']:.6g}"
+                f"nonneg_violation_mean: {h_res_constraint_log['train/h_res_constraint/nonneg_violation_mean']:.6g}, "
+                f"spectral_violation_mean: {h_res_constraint_log['train/h_res_constraint/spectral_violation_mean']:.6g}"
             )
             if wandb_log:
                 wandb.log(h_res_constraint_log, step=iter_num)
@@ -1202,6 +1219,8 @@ while True:
             f"row_res_max: {h_res_alm_update_log['train/h_res_alm/row_res_max']:.6g}, "
             f"col_res_max: {h_res_alm_update_log['train/h_res_alm/col_res_max']:.6g}, "
             f"nonneg_violation_max: {h_res_alm_update_log['train/h_res_alm/nonneg_violation_max']:.6g}, "
+            f"spectral_norm_max: {h_res_alm_update_log['train/h_res_alm/spectral_norm_max']:.6g}, "
+            f"spectral_violation_max: {h_res_alm_update_log['train/h_res_alm/spectral_violation_max']:.6g}, "
             f"row_dual_norm_max: {h_res_alm_update_log['train/h_res_alm/row_dual_norm_max']:.6g}, "
             f"col_dual_norm_max: {h_res_alm_update_log['train/h_res_alm/col_dual_norm_max']:.6g}, "
             f"nonneg_dual_norm_max: {h_res_alm_update_log['train/h_res_alm/nonneg_dual_norm_max']:.6g}"
