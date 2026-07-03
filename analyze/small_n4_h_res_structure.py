@@ -85,6 +85,8 @@ def infer_h_res_mode(path: Path, config: dict):
         return "admm_l2"
     if "alm-nonnegative" in label:
         return "alm_nonnegative"
+    if "alm-spectral-sprox" in label:
+        return "alm_spectral_sprox"
     if "alm-signed-sprox" in label:
         return "alm_signed_sprox"
     if "sinkhorn" in label:
@@ -140,7 +142,7 @@ def projected_h_res(
             smooth_beta=float(config.get("mhc_admm_smooth_beta", 0.5)),
             step_scale=float(config.get("mhc_admm_step_scale", 1.0)),
         )
-    if mode in {"alm_nonnegative", "alm_signed", "alm_signed_sprox"}:
+    if mode in {"alm_nonnegative", "alm_signed", "alm_signed_sprox", "alm_spectral_sprox"}:
         return h_res_logits
     if mode == "admm":
         return admm_doubly_stochastic(h_res_logits, iters=admm_iters, rho=admm_rho)

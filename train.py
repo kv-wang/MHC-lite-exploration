@@ -217,10 +217,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-if dataset == 'openwebtext':
-    data_dir = '/root/autodl-tmp/MHC-backup-20260413-023555/examples/nanogpt/data/openwebtext'
-else:
-    data_dir = os.path.join('data', dataset)
+data_dir = os.path.join('data', dataset)
 
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
