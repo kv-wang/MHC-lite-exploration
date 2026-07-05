@@ -56,8 +56,11 @@ mhc_admm_dual_step = 0.5   # S-prox-ALM dual update step for S-prox H_res modes
 mhc_admm_prox_weight = None # S-prox-ALM proximal weight; None uses mhc_admm_rho
 mhc_admm_smooth_beta = 0.5 # S-prox-ALM auxiliary smoothing factor
 mhc_admm_step_scale = 1.0  # S-prox-ALM primal step multiplier
+mhc_h_res_init_diag_mass_frac = 1.0 # ALM H_res init: fraction of total mass on diagonal; 1.0 = identity
 mhc_log_constraint_errors = False # log projected H_res row/column constraint errors during training
 mhc_constraint_log_interval = 100 # iteration interval for H_res constraint error logging
+mhc_log_h_res_diag_mass = False # log sum(diag(H_res)) / sum(H_res) during training
+mhc_h_res_diag_mass_log_interval = 1000 # iteration interval for H_res diagonal mass logging
 mhc_adapter_ckpt_path = "out-owt-medium-mhc-num-streams-4/ckpt.pt"
 mhc_adapter_base_streams = 4
 mhc_adapter_epsilon = 0.1
@@ -279,6 +282,7 @@ model_args = dict(
     mhc_admm_prox_weight=mhc_admm_prox_weight,
     mhc_admm_smooth_beta=mhc_admm_smooth_beta,
     mhc_admm_step_scale=mhc_admm_step_scale,
+    mhc_h_res_init_diag_mass_frac=mhc_h_res_init_diag_mass_frac,
     mhc_adapter_base_streams=mhc_adapter_base_streams,
     mhc_adapter_epsilon=mhc_adapter_epsilon,
     mhc_adapter_cap=mhc_adapter_cap,
@@ -644,6 +648,8 @@ _use_h_res_sprox_training = (
 
 if mhc_log_constraint_errors and mhc_constraint_log_interval < 1:
     raise ValueError("mhc_constraint_log_interval must be >= 1")
+if mhc_log_h_res_diag_mass and mhc_h_res_diag_mass_log_interval < 1:
+    raise ValueError("mhc_h_res_diag_mass_log_interval must be >= 1")
 
 
 def _iter_hc_modules():
@@ -711,6 +717,50 @@ def build_h_res_constraint_error_log(rows):
         log[f"train/h_res_constraint/col_err_max/{key}"] = stats["col_err_max"]
         log[f"train/h_res_constraint/nonneg_violation_max/{key}"] = stats["nonneg_violation_max"]
         log[f"train/h_res_constraint/spectral_violation_max/{key}"] = stats.get("spectral_violation_max", 0.)
+    return log
+
+
+def collect_h_res_diag_mass_ratios():
+    rows = []
+    eps = torch.finfo(torch.float32).eps
+    for block_idx, component, hc in _iter_hc_modules():
+        if not hasattr(hc, "static_h_res"):
+            continue
+        h_res = hc.static_h_res().detach().float()
+        diag_sum = h_res.diag().sum()
+        total_sum = h_res.sum()
+        denom = total_sum if total_sum.abs() > eps else total_sum.new_tensor(eps)
+        diag_mass_ratio = diag_sum / denom
+        layer_index = block_idx * 2 + (0 if component == "attn" else 1)
+        rows.append({
+            "layer_index": layer_index,
+            "component": component,
+            "diag_mass_ratio": float(diag_mass_ratio.item()),
+            "diag_sum": float(diag_sum.item()),
+            "total_sum": float(total_sum.item()),
+        })
+    return rows
+
+
+def build_h_res_diag_mass_log(rows):
+    if not rows:
+        return {}
+
+    ratios = [row["diag_mass_ratio"] for row in rows]
+    diag_sums = [row["diag_sum"] for row in rows]
+    total_sums = [row["total_sum"] for row in rows]
+    log = {
+        "train/h_res_diag_mass/ratio_mean": float(np.mean(ratios)),
+        "train/h_res_diag_mass/ratio_min": float(np.min(ratios)),
+        "train/h_res_diag_mass/ratio_max": float(np.max(ratios)),
+        "train/h_res_diag_mass/diag_sum_mean": float(np.mean(diag_sums)),
+        "train/h_res_diag_mass/total_sum_mean": float(np.mean(total_sums)),
+    }
+    for row in rows:
+        key = f"layer_{row['layer_index']}_{row['component']}"
+        log[f"train/h_res_diag_mass/ratio/{key}"] = row["diag_mass_ratio"]
+        log[f"train/h_res_diag_mass/diag_sum/{key}"] = row["diag_sum"]
+        log[f"train/h_res_diag_mass/total_sum/{key}"] = row["total_sum"]
     return log
 
 
@@ -1222,6 +1272,24 @@ while True:
             f"col_dual_norm_max: {h_res_alm_update_log['train/h_res_alm/col_dual_norm_max']:.6g}, "
             f"nonneg_dual_norm_max: {h_res_alm_update_log['train/h_res_alm/nonneg_dual_norm_max']:.6g}"
         )
+
+    h_res_diag_mass_log = None
+    log_h_res_diag_mass_this_iter = (
+        mhc_log_h_res_diag_mass
+        and _has_hc_modules
+        and iter_num % mhc_h_res_diag_mass_log_interval == 0
+    )
+    if log_h_res_diag_mass_this_iter and master_process:
+        h_res_diag_mass_log = build_h_res_diag_mass_log(collect_h_res_diag_mass_ratios())
+        if h_res_diag_mass_log:
+            print(
+                f"[iter {iter_num}] h_res diag mass "
+                f"ratio_mean: {h_res_diag_mass_log['train/h_res_diag_mass/ratio_mean']:.6g}, "
+                f"ratio_min: {h_res_diag_mass_log['train/h_res_diag_mass/ratio_min']:.6g}, "
+                f"ratio_max: {h_res_diag_mass_log['train/h_res_diag_mass/ratio_max']:.6g}"
+            )
+            if wandb_log:
+                wandb.log(h_res_diag_mass_log, step=iter_num)
 
     tpss.append(tokens_per_sec)
     train_losses.append(float(loss.detach()))

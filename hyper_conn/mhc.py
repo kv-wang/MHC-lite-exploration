@@ -42,6 +42,20 @@ def add(x, y):
     return x + y
 
 
+def make_equal_diag_offdiag_doubly_stochastic(size, diag_mass_frac=1.):
+    if size < 1:
+        raise ValueError("size must be >= 1")
+
+    diag_value = float(diag_mass_frac)
+    if size == 1:
+        return torch.ones((1, 1))
+
+    offdiag_value = (1. - diag_value) / (size - 1)
+    matrix = torch.full((size, size), offdiag_value)
+    matrix.fill_diagonal_(diag_value)
+    return matrix
+
+
 class Scale(Module):
     def __init__(self, scale):
         super().__init__()
@@ -566,6 +580,7 @@ class ManifoldConstrainedHyperConnections(Module):
         mhc_admm_prox_weight = None,
         mhc_admm_smooth_beta = 0.5,
         mhc_admm_step_scale = 1.,
+        mhc_h_res_init_diag_mass_frac = 1.,
         mhc_adapter_base_streams = 4,
         mhc_adapter_epsilon = 0.1,
         mhc_adapter_cap = 1.,
@@ -595,6 +610,8 @@ class ManifoldConstrainedHyperConnections(Module):
             raise ValueError("mhc_admm_smooth_beta must be > 0")
         if mhc_admm_step_scale <= 0:
             raise ValueError("mhc_admm_step_scale must be > 0")
+        if not 0 <= mhc_h_res_init_diag_mass_frac <= 1:
+            raise ValueError("mhc_h_res_init_diag_mass_frac must be in [0, 1]")
         if mhc_adapter_base_streams < 1:
             raise ValueError("mhc_adapter_base_streams must be >= 1")
         if mhc_adapter_epsilon <= 0:
@@ -649,8 +666,10 @@ class ManifoldConstrainedHyperConnections(Module):
             init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
             init_alpha0[init_residual_index, :] = 1.
         if mhc_h_res_mode in {"alm_signed", "alm_nonnegative", "alm_signed_sprox", "alm_spectral_sprox"}:
-            init_alpha1 = torch.zeros((num_residual_streams_fracs, num_residual_streams_fracs))
-            init_alpha1.fill_diagonal_(1.)
+            init_alpha1 = make_equal_diag_offdiag_doubly_stochastic(
+                num_residual_streams_fracs,
+                diag_mass_frac=mhc_h_res_init_diag_mass_frac,
+            )
         else:
             init_alpha1 = torch.ones((num_residual_streams_fracs, num_residual_streams_fracs)) * -8
             init_alpha1.fill_diagonal_(0.)
@@ -707,6 +726,7 @@ class ManifoldConstrainedHyperConnections(Module):
         self.mhc_admm_prox_weight = mhc_admm_prox_weight
         self.mhc_admm_smooth_beta = mhc_admm_smooth_beta
         self.mhc_admm_step_scale = mhc_admm_step_scale
+        self.mhc_h_res_init_diag_mass_frac = mhc_h_res_init_diag_mass_frac
         self.mhc_adapter_base_streams = mhc_adapter_base_streams
         self.mhc_adapter_epsilon = mhc_adapter_epsilon
         self.mhc_adapter_cap = mhc_adapter_cap
@@ -720,7 +740,10 @@ class ManifoldConstrainedHyperConnections(Module):
         h_res_alm_row_dual = torch.zeros(num_residual_streams_fracs, 1)
         h_res_alm_col_dual = torch.zeros(1, num_residual_streams_fracs)
         h_res_alm_nonneg_dual = torch.zeros(h_res_shape)
-        h_res_sprox_z = torch.eye(num_residual_streams_fracs)
+        h_res_sprox_z = make_equal_diag_offdiag_doubly_stochastic(
+            num_residual_streams_fracs,
+            diag_mass_frac=mhc_h_res_init_diag_mass_frac,
+        )
         self.register_buffer("h_res_alm_row_dual", h_res_alm_row_dual)
         self.register_buffer("h_res_alm_col_dual", h_res_alm_col_dual)
         self.register_buffer("h_res_alm_nonneg_dual", h_res_alm_nonneg_dual)
