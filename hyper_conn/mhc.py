@@ -581,6 +581,7 @@ class ManifoldConstrainedHyperConnections(Module):
         mhc_admm_smooth_beta = 0.5,
         mhc_admm_step_scale = 1.,
         mhc_h_res_init_diag_mass_frac = 1.,
+        mhc_h_res_cap = 1.5,
         mhc_adapter_base_streams = 4,
         mhc_adapter_epsilon = 0.1,
         mhc_adapter_cap = 1.,
@@ -592,7 +593,7 @@ class ManifoldConstrainedHyperConnections(Module):
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
         """
         super().__init__()
-        valid_h_res_modes = {"sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "alm_signed", "alm_nonnegative", "alm_signed_sprox", "alm_spectral_sprox", "cayley", "adapter_epsilon", "adapter_cap", "adapter_cap_admm"}
+        valid_h_res_modes = {"sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox", "cayley", "adapter_epsilon", "adapter_cap", "adapter_cap_admm"}
         if mhc_h_res_mode not in valid_h_res_modes:
             raise ValueError(f"Invalid mhc_h_res_mode: {mhc_h_res_mode}")
         valid_adapter_admm_input_modes = {"raw_logits", "sinkhorn_base_log"}
@@ -612,6 +613,8 @@ class ManifoldConstrainedHyperConnections(Module):
             raise ValueError("mhc_admm_step_scale must be > 0")
         if not 0 <= mhc_h_res_init_diag_mass_frac <= 1:
             raise ValueError("mhc_h_res_init_diag_mass_frac must be in [0, 1]")
+        if mhc_h_res_cap <= 0:
+            raise ValueError("mhc_h_res_cap must be > 0")
         if mhc_adapter_base_streams < 1:
             raise ValueError("mhc_adapter_base_streams must be >= 1")
         if mhc_adapter_epsilon <= 0:
@@ -665,7 +668,7 @@ class ManifoldConstrainedHyperConnections(Module):
         else:
             init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
             init_alpha0[init_residual_index, :] = 1.
-        if mhc_h_res_mode in {"alm_signed", "alm_nonnegative", "alm_signed_sprox", "alm_spectral_sprox"}:
+        if mhc_h_res_mode in {"alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox"}:
             init_alpha1 = make_equal_diag_offdiag_doubly_stochastic(
                 num_residual_streams_fracs,
                 diag_mass_frac=mhc_h_res_init_diag_mass_frac,
@@ -727,6 +730,7 @@ class ManifoldConstrainedHyperConnections(Module):
         self.mhc_admm_smooth_beta = mhc_admm_smooth_beta
         self.mhc_admm_step_scale = mhc_admm_step_scale
         self.mhc_h_res_init_diag_mass_frac = mhc_h_res_init_diag_mass_frac
+        self.mhc_h_res_cap = mhc_h_res_cap
         self.mhc_adapter_base_streams = mhc_adapter_base_streams
         self.mhc_adapter_epsilon = mhc_adapter_epsilon
         self.mhc_adapter_cap = mhc_adapter_cap
@@ -786,8 +790,13 @@ class ManifoldConstrainedHyperConnections(Module):
 
         with torch.no_grad():
             matrix = alpha_residual.detach().float()
-            row_err = (matrix.sum(dim=-1) - 1.).abs().amax().item()
-            col_err = (matrix.sum(dim=-2) - 1.).abs().amax().item()
+            if self.mhc_h_res_mode == "alm_nonnegative_cap":
+                cap = torch.as_tensor(self.mhc_h_res_cap, device=matrix.device, dtype=matrix.dtype)
+                row_err = (matrix.sum(dim=-1) - cap).clamp_min(0.).amax().item()
+                col_err = (matrix.sum(dim=-2) - cap).clamp_min(0.).amax().item()
+            else:
+                row_err = (matrix.sum(dim=-1) - 1.).abs().amax().item()
+                col_err = (matrix.sum(dim=-2) - 1.).abs().amax().item()
             if self.mhc_h_res_mode in {"alm_signed_sprox", "alm_spectral_sprox"}:
                 nonneg_violation = 0.
             else:
@@ -979,11 +988,21 @@ class ManifoldConstrainedHyperConnections(Module):
         primal_step = torch.as_tensor(self.mhc_admm_step_scale, device=x.device, dtype=x.dtype)
         smooth_beta = torch.as_tensor(self.mhc_admm_smooth_beta, device=x.device, dtype=x.dtype)
 
-        row_res = x.sum(dim=-1, keepdim=True) - 1.
-        col_res = x.sum(dim=-2, keepdim=True) - 1.
-
-        self.h_res_alm_row_dual.add_(dual_step * row_res.to(self.h_res_alm_row_dual.dtype))
-        self.h_res_alm_col_dual.add_(dual_step * col_res.to(self.h_res_alm_col_dual.dtype))
+        if self.mhc_h_res_mode == "alm_nonnegative_cap":
+            cap = torch.as_tensor(self.mhc_h_res_cap, device=x.device, dtype=x.dtype)
+            row_res = x.sum(dim=-1, keepdim=True) - cap
+            col_res = x.sum(dim=-2, keepdim=True) - cap
+            row_penalty_res = row_res.clamp_min(0.)
+            col_penalty_res = col_res.clamp_min(0.)
+            self.h_res_alm_row_dual.add_(dual_step * row_res.to(self.h_res_alm_row_dual.dtype)).clamp_(min=0.)
+            self.h_res_alm_col_dual.add_(dual_step * col_res.to(self.h_res_alm_col_dual.dtype)).clamp_(min=0.)
+        else:
+            row_res = x.sum(dim=-1, keepdim=True) - 1.
+            col_res = x.sum(dim=-2, keepdim=True) - 1.
+            row_penalty_res = row_res
+            col_penalty_res = col_res
+            self.h_res_alm_row_dual.add_(dual_step * row_res.to(self.h_res_alm_row_dual.dtype))
+            self.h_res_alm_col_dual.add_(dual_step * col_res.to(self.h_res_alm_col_dual.dtype))
 
         row_dual = self.h_res_alm_row_dual.to(device=x.device, dtype=x.dtype)
         col_dual = self.h_res_alm_col_dual.to(device=x.device, dtype=x.dtype)
@@ -993,20 +1012,25 @@ class ManifoldConstrainedHyperConnections(Module):
             grad_f
             + row_dual
             + col_dual
-            + rho * (row_res + col_res)
+            + rho * (row_penalty_res + col_penalty_res)
             + prox_weight * (x - z)
         )
         x_next = x - primal_step * grad_k
-        if self.mhc_h_res_mode == "alm_nonnegative":
+        if self.mhc_h_res_mode in {"alm_nonnegative", "alm_nonnegative_cap"}:
             x_next = x_next.clamp_min(0.)
         elif self.mhc_h_res_mode == "alm_spectral_sprox":
             x_next = project_spectral_residual_sphere(x_next, radius=1.)
         self.h_res_sprox_z.lerp_(x_next.to(self.h_res_sprox_z.dtype), smooth_beta.to(self.h_res_sprox_z.dtype))
         self.static_h_res().copy_(x_next.to(self.static_alpha.dtype))
 
-        next_row_res = x_next.sum(dim=-1, keepdim=True) - 1.
-        next_col_res = x_next.sum(dim=-2, keepdim=True) - 1.
-        if self.mhc_h_res_mode == "alm_nonnegative":
+        if self.mhc_h_res_mode == "alm_nonnegative_cap":
+            cap = torch.as_tensor(self.mhc_h_res_cap, device=x_next.device, dtype=x_next.dtype)
+            next_row_res = (x_next.sum(dim=-1, keepdim=True) - cap).clamp_min(0.)
+            next_col_res = (x_next.sum(dim=-2, keepdim=True) - cap).clamp_min(0.)
+        else:
+            next_row_res = x_next.sum(dim=-1, keepdim=True) - 1.
+            next_col_res = x_next.sum(dim=-2, keepdim=True) - 1.
+        if self.mhc_h_res_mode in {"alm_nonnegative", "alm_nonnegative_cap"}:
             nonneg_violation = (-x_next).clamp_min(0.)
         else:
             nonneg_violation = torch.zeros_like(x_next)
@@ -1081,7 +1105,7 @@ class ManifoldConstrainedHyperConnections(Module):
         alpha_scale      = cat((pre_branch_scale, residual_scale))
 
         dynamic_alpha = wc_weight * alpha_scale
-        if self.mhc_h_res_mode in {"alm_nonnegative", "alm_signed_sprox", "alm_spectral_sprox"}:
+        if self.mhc_h_res_mode in {"alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox"}:
             dynamic_alpha = dynamic_alpha.clone()
             dynamic_alpha[..., self.num_input_views:] = 0.
 
@@ -1217,7 +1241,7 @@ class ManifoldConstrainedHyperConnections(Module):
                         alpha_residual = project_admm_l2(alpha_residual)
                 elif self.mhc_h_res_mode == "alm_signed":
                     alpha_residual = self.apply_h_res_alm_loss(alpha_residual)
-                elif self.mhc_h_res_mode in {"alm_nonnegative", "alm_signed_sprox", "alm_spectral_sprox"}:
+                elif self.mhc_h_res_mode in {"alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox"}:
                     pass
                 elif self.mhc_h_res_mode == "adapter_epsilon":
                     target = torch.full(

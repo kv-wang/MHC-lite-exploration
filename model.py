@@ -172,6 +172,7 @@ class GPTConfig:
     mhc_admm_smooth_beta: float = 0.5
     mhc_admm_step_scale: float = 1.0
     mhc_h_res_init_diag_mass_frac: float = 1.0
+    mhc_h_res_cap: float = 1.5
     mhc_adapter_base_streams: int = 4
     mhc_adapter_epsilon: float = 0.1
     mhc_adapter_cap: float = 1.0
@@ -208,6 +209,7 @@ class GPT(nn.Module):
                 mhc_admm_smooth_beta=config.mhc_admm_smooth_beta,
                 mhc_admm_step_scale=config.mhc_admm_step_scale,
                 mhc_h_res_init_diag_mass_frac=config.mhc_h_res_init_diag_mass_frac,
+                mhc_h_res_cap=config.mhc_h_res_cap,
                 mhc_adapter_base_streams=config.mhc_adapter_base_streams,
                 mhc_adapter_epsilon=config.mhc_adapter_epsilon,
                 mhc_adapter_cap=config.mhc_adapter_cap,

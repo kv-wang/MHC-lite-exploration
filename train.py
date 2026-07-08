@@ -49,7 +49,7 @@ hyper_conn_expand_stream_mode = "repeat" # "repeat", "split", or "repeat_base_ze
 mhc_gate_fn = "sigmoid"    # "softmax" or "sigmoid" for H_pre/H_post (mhc/mhc_lite only)
 mhc_zero_init_pre_post_logits = False # True = initialize H_pre/H_post static logits to all zeros (mhc only)
 mhc_identity_h_res = False # True = H_res fixed to I, no stream mixing (mhc/mhc_lite only)
-mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "alm_signed", "alm_nonnegative", "alm_signed_sprox", "alm_spectral_sprox", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
+mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
 mhc_admm_iters = 20        # ADMM steps for H_res when mhc_h_res_mode uses ADMM
 mhc_admm_rho = 1.0         # ADMM penalty for H_res when mhc_h_res_mode uses ADMM
 mhc_admm_dual_step = 0.5   # S-prox-ALM dual update step for S-prox H_res modes
@@ -57,6 +57,7 @@ mhc_admm_prox_weight = None # S-prox-ALM proximal weight; None uses mhc_admm_rho
 mhc_admm_smooth_beta = 0.5 # S-prox-ALM auxiliary smoothing factor
 mhc_admm_step_scale = 1.0  # S-prox-ALM primal step multiplier
 mhc_h_res_init_diag_mass_frac = 1.0 # ALM H_res init: fraction of total mass on diagonal; 1.0 = identity
+mhc_h_res_cap = 1.5 # ALM cap mode: row/column sums are constrained to be <= this value
 mhc_log_constraint_errors = False # log projected H_res row/column constraint errors during training
 mhc_constraint_log_interval = 100 # iteration interval for H_res constraint error logging
 mhc_log_h_res_diag_mass = False # log sum(diag(H_res)) / sum(H_res) during training
@@ -107,6 +108,7 @@ wandb_notes = ""
 wandb_log_layer_stats = True
 wandb_log_layer_cosine = True
 wandb_log_layer_grad_norm = True
+wandb_log_h_matrix_grad_norm = False # log separate H_pre / H_res / H_post gradient norms
 wandb_log_layer_activation_norm = True
 wandb_log_layer_activation_grad_norm = True
 # data
@@ -220,7 +222,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+data_dir = os.path.join('/root/autodl-tmp/MHC-backup-20260413-023555/examples/nanogpt/data', dataset)
 
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
@@ -283,6 +285,7 @@ model_args = dict(
     mhc_admm_smooth_beta=mhc_admm_smooth_beta,
     mhc_admm_step_scale=mhc_admm_step_scale,
     mhc_h_res_init_diag_mass_frac=mhc_h_res_init_diag_mass_frac,
+    mhc_h_res_cap=mhc_h_res_cap,
     mhc_adapter_base_streams=mhc_adapter_base_streams,
     mhc_adapter_epsilon=mhc_adapter_epsilon,
     mhc_adapter_cap=mhc_adapter_cap,
@@ -642,7 +645,7 @@ _use_h_res_alm_loss_training = (
 )
 _use_h_res_sprox_training = (
     hyper_conn_type == "mhc"
-    and mhc_h_res_mode in {"alm_nonnegative", "alm_signed_sprox", "alm_spectral_sprox"}
+    and mhc_h_res_mode in {"alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox"}
     and _has_hc_modules
 )
 
@@ -1012,6 +1015,106 @@ def _module_grad_norm(module):
     return torch.sqrt(total_sq).item()
 
 
+def _append_grad_sq(parts, grad):
+    if grad is not None:
+        parts.append(grad.detach().float().pow(2).sum())
+
+
+def _grad_norm_from_parts(parts):
+    if not parts:
+        return None
+    total_sq = parts[0]
+    for grad_sq in parts[1:]:
+        total_sq = total_sq + grad_sq
+    return torch.sqrt(total_sq).item()
+
+
+def _dynamic_alpha_grad_pre_res(hc):
+    dynamic_alpha_fn = getattr(hc, "dynamic_alpha_fn", None)
+    grad = None if dynamic_alpha_fn is None else dynamic_alpha_fn.grad
+    if grad is None:
+        return None, None
+
+    streams = getattr(hc, "num_residual_streams", None)
+    if not streams or grad.shape[-1] % streams != 0:
+        return grad, None
+
+    width_per_stream = grad.shape[-1] // streams
+    pre_width = min(
+        getattr(hc, "num_input_views", 0) * getattr(hc, "num_fracs", 1),
+        width_per_stream,
+    )
+    grad_by_stream = grad.reshape(*grad.shape[:-1], streams, width_per_stream)
+    return grad_by_stream[..., :pre_width], grad_by_stream[..., pre_width:]
+
+
+def _hc_h_matrix_grad_norms(hc):
+    h_pre_parts = []
+    h_res_parts = []
+    h_post_parts = []
+
+    static_alpha = getattr(hc, "static_alpha", None)
+    if static_alpha is not None and static_alpha.grad is not None:
+        split = getattr(hc, "num_input_views", 0)
+        _append_grad_sq(h_pre_parts, static_alpha.grad[:, :split])
+        _append_grad_sq(h_res_parts, static_alpha.grad[:, split:])
+
+    dynamic_alpha_pre_grad, dynamic_alpha_res_grad = _dynamic_alpha_grad_pre_res(hc)
+    _append_grad_sq(h_pre_parts, dynamic_alpha_pre_grad)
+    _append_grad_sq(h_res_parts, dynamic_alpha_res_grad)
+
+    pre_branch_scale = getattr(hc, "pre_branch_scale", None)
+    _append_grad_sq(h_pre_parts, None if pre_branch_scale is None else pre_branch_scale.grad)
+
+    residual_scale = getattr(hc, "residual_scale", None)
+    _append_grad_sq(h_res_parts, None if residual_scale is None else residual_scale.grad)
+
+    for attr in ("static_beta", "dynamic_beta_fn", "h_post_scale"):
+        param = getattr(hc, attr, None)
+        _append_grad_sq(h_post_parts, None if param is None else param.grad)
+
+    return {
+        "h_pre": _grad_norm_from_parts(h_pre_parts),
+        "h_res": _grad_norm_from_parts(h_res_parts),
+        "h_post": _grad_norm_from_parts(h_post_parts),
+    }
+
+
+def collect_h_matrix_grad_norms():
+    rows = []
+    for block_idx, component, hc in _iter_hc_modules():
+        stats = _hc_h_matrix_grad_norms(hc)
+        if all(value is None for value in stats.values()):
+            continue
+        layer_index = block_idx * 2 + (0 if component == "attn" else 1)
+        rows.append((layer_index, component, stats))
+    return rows
+
+
+def build_h_matrix_grad_norm_log(rows):
+    if not rows:
+        return {}
+
+    log = {}
+    for matrix_name in ("h_pre", "h_res", "h_post"):
+        values = [
+            stats[matrix_name]
+            for _, _, stats in rows
+            if stats.get(matrix_name) is not None
+        ]
+        if not values:
+            continue
+        log[f"train/h_matrix_grad_norm/{matrix_name}_mean"] = float(np.mean(values))
+        log[f"train/h_matrix_grad_norm/{matrix_name}_max"] = float(np.max(values))
+        for layer_index, component, stats in rows:
+            value = stats.get(matrix_name)
+            if value is None:
+                continue
+            key = f"layer_{layer_index}_{component}"
+            log[f"train/h_matrix_grad_norm/{matrix_name}/{key}"] = value
+    return log
+
+
 def collect_layer_grad_norms():
     rows = []
     for block_idx, block in enumerate(raw_model.transformer.h):
@@ -1205,12 +1308,22 @@ while True:
     # gradient clipping + collect diagnostics
     grad_norm = -1.
     layer_grad_norms = None
+    h_matrix_grad_norms = None
     layer_activation_norms = None
     layer_activation_grad_norms = None
     grads_unscaled = False
-    if _use_h_res_sprox_training and scaler.is_enabled():
+    log_h_matrix_grad_norm_this_iter = (
+        wandb_log
+        and wandb_log_h_matrix_grad_norm
+        and _has_hc_modules
+        and master_process
+        and iter_num % log_interval == 0
+    )
+    if (_use_h_res_sprox_training or log_h_matrix_grad_norm_this_iter) and scaler.is_enabled():
         scaler.unscale_(optimizer)
         grads_unscaled = True
+    if log_h_matrix_grad_norm_this_iter:
+        h_matrix_grad_norms = collect_h_matrix_grad_norms()
     if _use_h_res_sprox_training:
         prepare_h_res_sprox_steps()
     if grad_clip > 0.:
@@ -1331,6 +1444,10 @@ while True:
             if h_res_alm_update_log:
                 log_dict.update(h_res_alm_update_log)
             wandb.log(log_dict, step=iter_num)
+            if wandb_log_h_matrix_grad_norm and h_matrix_grad_norms is not None:
+                h_matrix_log = build_h_matrix_grad_norm_log(h_matrix_grad_norms)
+                if h_matrix_log:
+                    wandb.log(h_matrix_log, step=iter_num)
             if wandb_log_layer_grad_norm and layer_grad_norms is not None:
                 lg = build_layer_scalar_log("train/layer_parameter_grad_norm", layer_grad_norms)
                 if lg:
