@@ -16,7 +16,7 @@ cd "$SCRIPT_DIR"
 export WANDB_API_KEY="${WANDB_API_KEY:-2eaf5d3e15da1d68fbce32137184e1eaba001ff6}"
 export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.bandw.top}"
 
-N_GPUS="${N_GPUS:-1}"
+N_GPUS="${N_GPUS:-4}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-config/train_owt.py}"
 MODEL_CONFIG="${MODEL_CONFIG:-config/small_model.py}"
 METHOD_CONFIG="${METHOD_CONFIG:-config/with_mhc_alm_nonnegative_cap.py}"
