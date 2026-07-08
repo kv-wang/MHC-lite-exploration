@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./run_hc.sh
-#   N_GPUS=1 MAX_ITERS=100 ./run_hc.sh
+#   N_GPUS=1 MAX_ITERS=100 N_STREAMS=4 ./run_hc.sh
 
 set -e
 
@@ -19,17 +19,19 @@ export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.bandw.top}"
 N_GPUS="${N_GPUS:-1}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-config/train_owt.py}"
 MODEL_CONFIG="${MODEL_CONFIG:-config/small_model.py}"
+N_STREAMS="${N_STREAMS:-4}"
 MAX_ITERS="${MAX_ITERS:-10000}"
 EVAL_ITERS="${EVAL_ITERS:-200}"
 WANDB_PROJECT="${WANDB_PROJECT:-ablation_num_streams_small}"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-hc-small-${MAX_ITERS}iter}"
-OUT_PREFIX_METHOD="${OUT_PREFIX_METHOD:-hc-${MAX_ITERS}iter}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-hc-small-${N_STREAMS}streams-${MAX_ITERS}iter}"
+OUT_PREFIX_METHOD="${OUT_PREFIX_METHOD:-hc-${N_STREAMS}streams-${MAX_ITERS}iter}"
 
 echo ""
 echo "================================================================"
 echo " Running small HC training"
 echo " train_config:      $TRAIN_CONFIG"
 echo " model_config:      $MODEL_CONFIG"
+echo " n_streams:         $N_STREAMS"
 echo " max_iters:         $MAX_ITERS"
 echo " eval_iters:        $EVAL_ITERS"
 echo " n_gpus:            $N_GPUS"
@@ -42,6 +44,7 @@ common_args=(
   "$TRAIN_CONFIG"
   "$MODEL_CONFIG"
   --hyper_conn_type=hc
+  --hyper_conn_n="$N_STREAMS"
   --max_iters="$MAX_ITERS"
   --eval_iters="$EVAL_ITERS"
   --wandb_log=True
