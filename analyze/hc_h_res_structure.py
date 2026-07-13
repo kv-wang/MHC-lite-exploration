@@ -59,14 +59,35 @@ def split_static_h_res(static_alpha: torch.Tensor):
     return static_alpha[:, num_input_views:].float()
 
 
-def projected_h_res(static_alpha: torch.Tensor, config: dict):
+def identity_tanh_offdiag_h_res(h_res_logits: torch.Tensor, config: dict, state: dict | None, key: str | None):
+    n = h_res_logits.shape[0]
+    eye = torch.eye(n, dtype=h_res_logits.dtype, device=h_res_logits.device)
+    offdiag_mask = 1. - eye
+    default_scale = float(config.get("mhc_h_res_offdiag_init_scale", 0.05))
+    gamma = torch.as_tensor(default_scale, dtype=h_res_logits.dtype, device=h_res_logits.device)
+    if state is not None and key is not None:
+        scale_key = key.rsplit(".static_alpha", 1)[0] + ".h_res_offdiag_log_scale"
+        if scale_key in state:
+            gamma = state[scale_key].detach().float().exp().to(dtype=h_res_logits.dtype, device=h_res_logits.device)
+    return eye + gamma * offdiag_mask * h_res_logits.tanh()
+
+
+def projected_h_res(static_alpha: torch.Tensor, config: dict, state: dict | None = None, key: str | None = None):
     h = split_static_h_res(static_alpha)
     n = h.shape[0]
+    hyper_conn_type = config.get("hyper_conn_type", "")
     mode = config.get("mhc_h_res_mode", "sinkhorn")
+
+    # HC trains and uses the static residual block directly. It is not an mHC
+    # logits matrix and must not be passed through Sinkhorn/ADMM projection.
+    if hyper_conn_type == "hc":
+        return h
 
     if config.get("mhc_identity_h_res", False):
         return torch.eye(n, dtype=h.dtype)
 
+    if mode == "identity_tanh_offdiag":
+        return identity_tanh_offdiag_h_res(h, config, state, key).float()
     if mode == "sinkhorn":
         return sinkhorn_knopps(h, int(config.get("sinkhorn_iters", 20))).float()
     if mode == "admm_reverse_kl":
@@ -120,11 +141,20 @@ def projected_h_res(static_alpha: torch.Tensor, config: dict):
         return cayley_orthogonalize(h).float()
 
     # ALM/S-prox modes train H_res directly in static_alpha.
-    if mode in {"alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox"}:
+    if mode in {"unconstrained", "alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox"}:
         return h
 
     # Fallback: report raw residual block rather than silently failing.
     return h
+
+
+def h_res_mode_label(config: dict):
+    hyper_conn_type = config.get("hyper_conn_type", "")
+    if hyper_conn_type == "hc":
+        return "hc_raw_static"
+    if hyper_conn_type:
+        return config.get("mhc_h_res_mode", "")
+    return config.get("mhc_h_res_mode", "sinkhorn")
 
 
 def h_res_metrics(h_res: torch.Tensor, thresholds: tuple[float, ...]):
@@ -285,7 +315,7 @@ def print_summary(summary_rows: list[dict]):
 
 
 def analyze_checkpoint(path: Path, thresholds: tuple[float, ...], top_edges: int):
-    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
     state = checkpoint["model"]
     config = checkpoint.get("config", {})
     keys = sorted([key for key in state if key.endswith(".static_alpha")], key=static_alpha_sort_key)
@@ -295,7 +325,7 @@ def analyze_checkpoint(path: Path, thresholds: tuple[float, ...], top_edges: int
     rows = []
     edges = {}
     for key in keys:
-        h_res = projected_h_res(state[key], config)
+        h_res = projected_h_res(state[key], config, state=state, key=key)
         layer, component = parse_layer_key(key)
         metrics = h_res_metrics(h_res, thresholds)
         row = {
@@ -318,7 +348,7 @@ def analyze_checkpoint(path: Path, thresholds: tuple[float, ...], top_edges: int
         "label": path.parent.name,
         "iter_num": checkpoint.get("iter_num", ""),
         "best_val_loss": as_float(checkpoint.get("best_val_loss")),
-        "mode": config.get("mhc_h_res_mode", "sinkhorn"),
+        "mode": h_res_mode_label(config),
         "n": config.get("hyper_conn_n", rows[0]["n"]),
         "reduce": config.get("hyper_conn_reduce_stream_mode", ""),
         "model": config.get("out_prefix_model", ""),

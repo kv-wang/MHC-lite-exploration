@@ -56,6 +56,24 @@ def extract_h_res(static_alpha: torch.Tensor):
     return static_alpha[:, num_input_views:].float()
 
 
+def effective_h_res(static_alpha: torch.Tensor, config: dict, state: dict, key: str):
+    h = extract_h_res(static_alpha)
+    if config.get("mhc_h_res_mode") != "identity_tanh_offdiag":
+        return h
+    n = h.shape[0]
+    eye = torch.eye(n, dtype=h.dtype, device=h.device)
+    offdiag_mask = 1. - eye
+    gamma = torch.as_tensor(
+        float(config.get("mhc_h_res_offdiag_init_scale", 0.05)),
+        dtype=h.dtype,
+        device=h.device,
+    )
+    scale_key = key.rsplit(".static_alpha", 1)[0] + ".h_res_offdiag_log_scale"
+    if scale_key in state:
+        gamma = state[scale_key].detach().float().exp().to(dtype=h.dtype, device=h.device)
+    return eye + gamma * offdiag_mask * h.tanh()
+
+
 def h_res_metrics(h_res: torch.Tensor, sparsity_thresholds: tuple[float, ...]):
     if h_res.ndim != 2 or h_res.shape[0] != h_res.shape[1]:
         raise ValueError(f"H_res must be square 2D matrix, got shape {tuple(h_res.shape)}")
@@ -229,7 +247,7 @@ def analyze_checkpoint(path: Path, sparsity_thresholds: tuple[float, ...], top_e
     edges = {}
     for key in static_keys:
         static_alpha = state[key]
-        h_res = extract_h_res(static_alpha)
+        h_res = effective_h_res(static_alpha, config, state, key)
         layer_idx, component = parse_layer_key(key)
         metrics = h_res_metrics(h_res, sparsity_thresholds)
         row = {

@@ -98,6 +98,8 @@ def projected_h_res(
     h_res_logits: torch.Tensor,
     mode: str,
     config: dict,
+    state: dict | None = None,
+    key: str | None = None,
 ):
     n = h_res_logits.shape[-1]
     sinkhorn_iters = int(config.get("sinkhorn_iters", 20))
@@ -109,6 +111,22 @@ def projected_h_res(
 
     if mode == "identity":
         return torch.eye(n, dtype=h_res_logits.dtype, device=h_res_logits.device)
+    if mode == "identity_tanh_offdiag":
+        eye = torch.eye(n, dtype=h_res_logits.dtype, device=h_res_logits.device)
+        offdiag_mask = 1. - eye
+        gamma = torch.as_tensor(
+            float(config.get("mhc_h_res_offdiag_init_scale", 0.05)),
+            dtype=h_res_logits.dtype,
+            device=h_res_logits.device,
+        )
+        if state is not None and key is not None:
+            scale_key = key.rsplit(".static_alpha", 1)[0] + ".h_res_offdiag_log_scale"
+            if scale_key in state:
+                gamma = state[scale_key].detach().float().exp().to(
+                    dtype=h_res_logits.dtype,
+                    device=h_res_logits.device,
+                )
+        return eye + gamma * offdiag_mask * h_res_logits.tanh()
     if mode == "sinkhorn":
         return sinkhorn_knopps(h_res_logits, sinkhorn_iters)
     if mode == "admm_reverse_kl":
@@ -324,7 +342,7 @@ def analyze_checkpoint(path: Path, sparsity_thresholds: tuple[float, ...], top_e
     edges = {}
     for key in static_keys:
         h_res_logits = extract_h_res_logits(state[key])
-        h_res = projected_h_res(h_res_logits, mode=mode, config=config)
+        h_res = projected_h_res(h_res_logits, mode=mode, config=config, state=state, key=key)
         if torch.isnan(h_res).any() or torch.isinf(h_res).any():
             raise ValueError(f"NaN/Inf in projected H_res for {path}: {key}")
         layer_idx, component = parse_layer_key(key)

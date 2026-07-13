@@ -49,7 +49,7 @@ hyper_conn_expand_stream_mode = "repeat" # "repeat", "split", or "repeat_base_ze
 mhc_gate_fn = "sigmoid"    # "softmax" or "sigmoid" for H_pre/H_post (mhc/mhc_lite only)
 mhc_zero_init_pre_post_logits = False # True = initialize H_pre/H_post static logits to all zeros (mhc only)
 mhc_identity_h_res = False # True = H_res fixed to I, no stream mixing (mhc/mhc_lite only)
-mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
+mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "unconstrained", "identity_tanh_offdiag", "alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
 mhc_admm_iters = 20        # ADMM steps for H_res when mhc_h_res_mode uses ADMM
 mhc_admm_rho = 1.0         # ADMM penalty for H_res when mhc_h_res_mode uses ADMM
 mhc_admm_dual_step = 0.5   # S-prox-ALM dual update step for S-prox H_res modes
@@ -58,6 +58,7 @@ mhc_admm_smooth_beta = 0.5 # S-prox-ALM auxiliary smoothing factor
 mhc_admm_step_scale = 1.0  # S-prox-ALM primal step multiplier
 mhc_h_res_init_diag_mass_frac = 1.0 # ALM H_res init: fraction of total mass on diagonal; 1.0 = identity
 mhc_h_res_cap = 1.5 # ALM cap mode: row/column sums are constrained to be <= this value
+mhc_h_res_offdiag_init_scale = 0.05 # identity_tanh_offdiag: initial gamma scale for trainable off-diagonal H_res
 mhc_log_constraint_errors = False # log projected H_res row/column constraint errors during training
 mhc_constraint_log_interval = 100 # iteration interval for H_res constraint error logging
 mhc_log_h_res_diag_mass = False # log sum(diag(H_res)) / sum(H_res) during training
@@ -93,12 +94,14 @@ log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # legacy config; checkpoints are saved only once at the final iteration
+checkpoint_interval = 0 # > 0 saves every N local training iterations, overwriting ckpt.pt
 init_from = 'scratch' # 'scratch', 'resume', 'continue_ckpt', 'mhc_adapter', or 'gpt2*'
 continue_ckpt_path = "out-owt-medium-mhc-num-streams-4/ckpt.pt"
 continue_load_optimizer = True
 continue_reset_iter = True
 continue_reset_best_val_loss = True
 continue_fixed_lr_from_ckpt = True
+continue_override_mhc_h_res_mode = False
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'owt'
@@ -111,6 +114,8 @@ wandb_log_layer_grad_norm = True
 wandb_log_h_matrix_grad_norm = False # log separate H_pre / H_res / H_post gradient norms
 wandb_log_layer_activation_norm = True
 wandb_log_layer_activation_grad_norm = True
+h_res_grad_dump_interval = 0 # > 0 writes H_res LM gradient matrices to JSON every N training iterations
+h_res_grad_dump_dir = "" # empty defaults to <out_dir>/h_res_gradients
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -222,7 +227,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('/root/autodl-tmp/MHC-backup-20260413-023555/examples/nanogpt/data', dataset)
+data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', dataset)
 
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
@@ -286,6 +291,7 @@ model_args = dict(
     mhc_admm_step_scale=mhc_admm_step_scale,
     mhc_h_res_init_diag_mass_frac=mhc_h_res_init_diag_mass_frac,
     mhc_h_res_cap=mhc_h_res_cap,
+    mhc_h_res_offdiag_init_scale=mhc_h_res_offdiag_init_scale,
     mhc_adapter_base_streams=mhc_adapter_base_streams,
     mhc_adapter_epsilon=mhc_adapter_epsilon,
     mhc_adapter_cap=mhc_adapter_cap,
@@ -494,6 +500,9 @@ elif init_from == 'continue_ckpt':
     for k in model_args:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
+    if continue_override_mhc_h_res_mode:
+        model_args['mhc_h_res_mode'] = mhc_h_res_mode
+        print(f"Overriding checkpoint H_res mode with: {mhc_h_res_mode}")
 
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -616,7 +625,7 @@ def get_lr(it):
 
 raw_model = model.module if ddp else model
 
-def save_final_checkpoint(saved_iter_num):
+def save_checkpoint(saved_iter_num, checkpoint_kind):
     if not master_process:
         return
     checkpoint = {
@@ -627,8 +636,11 @@ def save_final_checkpoint(saved_iter_num):
         'best_val_loss': best_val_loss,
         'config': config,
     }
-    print(f"saving final checkpoint to {out_dir}")
-    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    tmp_ckpt_path = f"{ckpt_path}.tmp"
+    print(f"saving {checkpoint_kind} checkpoint at iter {saved_iter_num} to {ckpt_path}")
+    torch.save(checkpoint, tmp_ckpt_path)
+    os.replace(tmp_ckpt_path, ckpt_path)
 
 def _get_hc_modules(block):
     if hasattr(block, 'hc_attn') and hasattr(block, 'hc_mlp'):
@@ -729,7 +741,10 @@ def collect_h_res_diag_mass_ratios():
     for block_idx, component, hc in _iter_hc_modules():
         if not hasattr(hc, "static_h_res"):
             continue
-        h_res = hc.static_h_res().detach().float()
+        if hasattr(hc, "effective_static_h_res"):
+            h_res = hc.effective_static_h_res().detach().float()
+        else:
+            h_res = hc.static_h_res().detach().float()
         diag_sum = h_res.diag().sum()
         total_sum = h_res.sum()
         denom = total_sum if total_sum.abs() > eps else total_sum.new_tensor(eps)
@@ -1091,10 +1106,52 @@ def collect_h_matrix_grad_norms():
     return rows
 
 
-def build_h_matrix_grad_norm_log(rows):
+def collect_static_h_res_grad_matrices():
+    rows = []
+    for block_idx, component, hc in _iter_hc_modules():
+        static_alpha = getattr(hc, "static_alpha", None)
+        if static_alpha is None or static_alpha.grad is None:
+            continue
+        split = getattr(hc, "num_input_views", 0)
+        grad = static_alpha.grad[:, split:].detach().float().cpu()
+        layer_index = block_idx * 2 + (0 if component == "attn" else 1)
+        rows.append({
+            "layer_index": layer_index,
+            "component": component,
+            "key": f"transformer.h.{block_idx}.hc_{component}.static_alpha",
+            "shape": list(grad.shape),
+            "grad_l2_norm": float(torch.linalg.vector_norm(grad).item()),
+            "grad_abs_mean": float(grad.abs().mean().item()),
+            "grad_abs_max": float(grad.abs().max().item()),
+            "gradient": grad.tolist(),
+        })
+    return rows
+
+
+def dump_static_h_res_grad_matrices(iter_num, rows):
+    if not rows or not master_process:
+        return None
+    dump_dir = h_res_grad_dump_dir or os.path.join(out_dir, "h_res_gradients")
+    os.makedirs(dump_dir, exist_ok=True)
+    path = os.path.join(dump_dir, f"h_res_grad_iter_{iter_num:07d}.json")
+    payload = {
+        "iter_num": iter_num,
+        "num_layers": len(rows),
+        "gradient_source": "static_alpha residual block after LM loss backward, before H_res S-prox update",
+        "layers": rows,
+    }
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, path)
+    return path
+
+
+def build_h_matrix_grad_norm_log(rows, update_scales=None):
     if not rows:
         return {}
 
+    update_scales = update_scales or {}
     log = {}
     for matrix_name in ("h_pre", "h_res", "h_post"):
         values = [
@@ -1106,12 +1163,20 @@ def build_h_matrix_grad_norm_log(rows):
             continue
         log[f"train/h_matrix_grad_norm/{matrix_name}_mean"] = float(np.mean(values))
         log[f"train/h_matrix_grad_norm/{matrix_name}_max"] = float(np.max(values))
+        if matrix_name in update_scales:
+            update_scale = float(update_scales[matrix_name])
+            update_values = [value * update_scale for value in values]
+            log[f"train/h_matrix_update_norm/{matrix_name}_mean"] = float(np.mean(update_values))
+            log[f"train/h_matrix_update_norm/{matrix_name}_max"] = float(np.max(update_values))
+            log[f"train/h_matrix_update_norm/{matrix_name}_scale"] = update_scale
         for layer_index, component, stats in rows:
             value = stats.get(matrix_name)
             if value is None:
                 continue
             key = f"layer_{layer_index}_{component}"
             log[f"train/h_matrix_grad_norm/{matrix_name}/{key}"] = value
+            if matrix_name in update_scales:
+                log[f"train/h_matrix_update_norm/{matrix_name}/{key}"] = value * float(update_scales[matrix_name])
     return log
 
 
@@ -1309,6 +1374,7 @@ while True:
     grad_norm = -1.
     layer_grad_norms = None
     h_matrix_grad_norms = None
+    h_res_grad_dump_rows = None
     layer_activation_norms = None
     layer_activation_grad_norms = None
     grads_unscaled = False
@@ -1324,6 +1390,13 @@ while True:
         grads_unscaled = True
     if log_h_matrix_grad_norm_this_iter:
         h_matrix_grad_norms = collect_h_matrix_grad_norms()
+    if (
+        h_res_grad_dump_interval > 0
+        and _has_hc_modules
+        and master_process
+        and iter_num % h_res_grad_dump_interval == 0
+    ):
+        h_res_grad_dump_rows = collect_static_h_res_grad_matrices()
     if _use_h_res_sprox_training:
         prepare_h_res_sprox_steps()
     if grad_clip > 0.:
@@ -1355,6 +1428,10 @@ while True:
     train_time_end = time.time()
     d_train_time = train_time_end - train_time_start
     tokens_per_sec = tokens_per_iter / d_train_time
+    if h_res_grad_dump_rows is not None:
+        dump_path = dump_static_h_res_grad_matrices(iter_num, h_res_grad_dump_rows)
+        if dump_path:
+            print(f"[iter {iter_num}] wrote H_res gradient dump to {dump_path}")
 
     if h_res_constraint_errors is not None and master_process:
         h_res_constraint_log = build_h_res_constraint_error_log(h_res_constraint_errors)
@@ -1445,7 +1522,15 @@ while True:
                 log_dict.update(h_res_alm_update_log)
             wandb.log(log_dict, step=iter_num)
             if wandb_log_h_matrix_grad_norm and h_matrix_grad_norms is not None:
-                h_matrix_log = build_h_matrix_grad_norm_log(h_matrix_grad_norms)
+                h_res_update_scale = mhc_admm_step_scale if _use_h_res_sprox_training else lr
+                h_matrix_log = build_h_matrix_grad_norm_log(
+                    h_matrix_grad_norms,
+                    update_scales={
+                        "h_pre": lr,
+                        "h_res": h_res_update_scale,
+                        "h_post": lr,
+                    },
+                )
                 if h_matrix_log:
                     wandb.log(h_matrix_log, step=iter_num)
             if wandb_log_layer_grad_norm and layer_grad_norms is not None:
@@ -1467,11 +1552,25 @@ while True:
     iter_num += 1
     local_iter_num += 1
 
+    if (
+        not eval_only
+        and checkpoint_interval > 0
+        and local_iter_num % checkpoint_interval == 0
+    ):
+        save_checkpoint(iter_num - 1, "periodic")
+
     if iter_num > max_iters:
         break
 
 if not eval_only and iter_num > 0:
-    save_final_checkpoint(iter_num - 1)
+    final_iter_num = iter_num - 1
+    final_was_periodic = (
+        checkpoint_interval > 0
+        and local_iter_num > 0
+        and local_iter_num % checkpoint_interval == 0
+    )
+    if not final_was_periodic:
+        save_checkpoint(final_iter_num, "final")
 
 if ddp:
     destroy_process_group()
