@@ -44,7 +44,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # ----- hyper conn start -----
 hyper_conn_type = "none" # none, hc, mhc, mhc_lite, attn_res
 hyper_conn_n = 1 # num_streams
-hyper_conn_reduce_stream_mode = "sum" # "sum", "mean", "4mean", or "softmax_4mean" for final multi-stream reduction
+hyper_conn_reduce_stream_mode = "sum" # "sum", "mean", "4mean", "softmax_4mean", or "score_router_4mean" for final multi-stream reduction
 hyper_conn_expand_stream_mode = "repeat" # "repeat", "split", or "repeat_base_zero_rest" for initial multi-stream expansion
 mhc_gate_fn = "sigmoid"    # "softmax" or "sigmoid" for H_pre/H_post (mhc/mhc_lite only)
 mhc_zero_init_pre_post_logits = False # True = initialize H_pre/H_post static logits to all zeros (mhc only)

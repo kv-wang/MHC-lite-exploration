@@ -246,6 +246,7 @@ class GPT(nn.Module):
             init_hc, expand_stream, reduce_stream = hyper_conn_init_func(
                 config.hyper_conn_type,
                 config.hyper_conn_n,
+                dim=config.n_embd,
                 reduce_stream_mode=config.hyper_conn_reduce_stream_mode,
                 expand_stream_mode=config.hyper_conn_expand_stream_mode,
                 **hc_kwargs,

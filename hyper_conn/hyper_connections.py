@@ -63,6 +63,21 @@ class SoftmaxWeightedReduceStreams(Module):
         view_shape = (1, self.num_streams) + (1,) * (residuals.ndim - 2)
         return (residuals * weights.view(view_shape)).sum(dim=1) * self.scale
 
+
+class ScoreRouterReduceStreams(Module):
+    def __init__(self, num_streams, dim, scale=4.):
+        super().__init__()
+        self.num_streams = num_streams
+        self.scale = scale
+        self.score_weight = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, residuals):
+        residuals = rearrange(residuals, '(b s) ... d -> b s ... d', s=self.num_streams)
+        score_weight = self.score_weight.to(device=residuals.device, dtype=residuals.dtype)
+        scores = (residuals * score_weight).sum(dim=-1)
+        weights = scores.softmax(dim=1)
+        return (residuals * weights.unsqueeze(-1)).sum(dim=1) * self.scale
+
 # main functions
 
 def get_expand_reduce_stream_functions(
@@ -76,7 +91,7 @@ def get_expand_reduce_stream_functions(
     if num_streams == 1 or disable:
         return (nn.Identity(), nn.Identity())
 
-    if reduce_stream_mode not in {"sum", "mean", "4mean", "softmax_4mean"}:
+    if reduce_stream_mode not in {"sum", "mean", "4mean", "softmax_4mean", "score_router_4mean"}:
         raise ValueError(f"Invalid reduce_stream_mode: {reduce_stream_mode}")
     if expand_stream_mode not in {"repeat", "split"}:
         raise ValueError(f"Invalid expand_stream_mode: {expand_stream_mode}")
@@ -95,6 +110,9 @@ def get_expand_reduce_stream_functions(
         )
     elif reduce_stream_mode == "softmax_4mean":
         reduce_fn = SoftmaxWeightedReduceStreams(num_streams, scale=4.)
+    elif reduce_stream_mode == "score_router_4mean":
+        assert exists(dim), '`dim` must be passed for reduce_stream_mode="score_router_4mean"'
+        reduce_fn = ScoreRouterReduceStreams(num_streams, dim=dim, scale=4.)
     else:
         reduce_fn = Reduce(pattern = '(b s) ... -> b ...', reduction = reduce_stream_mode, s = num_streams)
 
