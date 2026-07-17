@@ -57,6 +57,16 @@ def make_equal_diag_offdiag_doubly_stochastic(size, diag_mass_frac=1.):
     return matrix
 
 
+DYNAMIC_H_RES_DISABLED_MODES = {
+    "unconstrained",
+    "identity_tanh_offdiag",
+    "alm_nonnegative",
+    "alm_nonnegative_cap",
+    "alm_signed_sprox",
+    "alm_spectral_sprox",
+}
+
+
 class Scale(Module):
     def __init__(self, scale):
         super().__init__()
@@ -584,6 +594,7 @@ class ManifoldConstrainedHyperConnections(Module):
         mhc_h_res_init_diag_mass_frac = 1.,
         mhc_h_res_cap = 1.5,
         mhc_h_res_offdiag_init_scale = 0.05,
+        mhc_disable_dynamic_h_res = False,
         mhc_adapter_base_streams = 4,
         mhc_adapter_epsilon = 0.1,
         mhc_adapter_cap = 1.,
@@ -619,6 +630,11 @@ class ManifoldConstrainedHyperConnections(Module):
             raise ValueError("mhc_h_res_cap must be > 0")
         if mhc_h_res_offdiag_init_scale <= 0:
             raise ValueError("mhc_h_res_offdiag_init_scale must be > 0")
+        if mhc_disable_dynamic_h_res and mhc_h_res_mode not in DYNAMIC_H_RES_DISABLED_MODES:
+            raise ValueError(
+                f"mhc_disable_dynamic_h_res=True is only supported for modes "
+                f"{sorted(DYNAMIC_H_RES_DISABLED_MODES)}, got {mhc_h_res_mode!r}"
+            )
         if mhc_adapter_base_streams < 1:
             raise ValueError("mhc_adapter_base_streams must be >= 1")
         if mhc_adapter_epsilon <= 0:
@@ -684,14 +700,17 @@ class ManifoldConstrainedHyperConnections(Module):
             init_alpha1.fill_diagonal_(0.)
         self.static_alpha = nn.Parameter(cat((init_alpha0, init_alpha1), dim = 1))
 
-        # ------
-        # XXX we modified the original implementation here 
-        # H_res is from nC to n^2, instead of from (n, C) to (n, n) 
-        # ------
+        self.dynamic_h_res_disabled = bool(
+            mhc_disable_dynamic_h_res and mhc_h_res_mode in DYNAMIC_H_RES_DISABLED_MODES
+        )
+        dynamic_alpha_out_dim = num_fracs * num_residual_streams * num_input_views
+        if not self.dynamic_h_res_disabled:
+            dynamic_alpha_out_dim += num_fracs * num_residual_streams * num_residual_streams
+
         self.dynamic_alpha_fn = nn.Parameter(
             torch.zeros(
                 dim * num_residual_streams, 
-                num_fracs * ( num_residual_streams * num_residual_streams + num_residual_streams * num_input_views )
+                dynamic_alpha_out_dim
             ) 
         )
 
@@ -742,6 +761,7 @@ class ManifoldConstrainedHyperConnections(Module):
         self.mhc_h_res_init_diag_mass_frac = mhc_h_res_init_diag_mass_frac
         self.mhc_h_res_cap = mhc_h_res_cap
         self.mhc_h_res_offdiag_init_scale = mhc_h_res_offdiag_init_scale
+        self.mhc_disable_dynamic_h_res = mhc_disable_dynamic_h_res
         self.mhc_adapter_base_streams = mhc_adapter_base_streams
         self.mhc_adapter_epsilon = mhc_adapter_epsilon
         self.mhc_adapter_cap = mhc_adapter_cap
@@ -1130,16 +1150,24 @@ class ManifoldConstrainedHyperConnections(Module):
             if base_streams < streams:
                 normed = normed * ((base_streams / streams) ** 0.5)
 
-        # alpha for weighted sum of residuals going into branch
-        wc_weight = normed @ self.dynamic_alpha_fn # ... f (s v+s)
-        wc_weight = rearrange(wc_weight, '... (s t) -> ... s t', s = streams)
-
         pre_branch_scale = repeat(self.pre_branch_scale, '1 -> v', v = self.num_input_views * self.num_fracs)
         residual_scale   = repeat(self.residual_scale  , '1 -> s', s = self.num_fracs * streams)
-        alpha_scale      = cat((pre_branch_scale, residual_scale))
 
-        dynamic_alpha = wc_weight * alpha_scale
-        if self.mhc_h_res_mode in {"unconstrained", "identity_tanh_offdiag", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox"}:
+        # alpha for weighted sum of residuals going into branch. Some H_res
+        # modes use static H_res only, so their dynamic network emits H_pre
+        # logits only instead of generating then zeroing a dynamic H_res block.
+        wc_weight = normed @ self.dynamic_alpha_fn
+        if self.dynamic_h_res_disabled:
+            wc_weight = rearrange(wc_weight, '... (s v) -> ... s v', s = streams)
+            dynamic_pre = wc_weight * pre_branch_scale
+            dynamic_residual = dynamic_pre.new_zeros(*dynamic_pre.shape[:-1], self.num_fracs * streams)
+            dynamic_alpha = cat((dynamic_pre, dynamic_residual), dim=-1)
+        else:
+            wc_weight = rearrange(wc_weight, '... (s t) -> ... s t', s = streams)
+            alpha_scale = cat((pre_branch_scale, residual_scale))
+            dynamic_alpha = wc_weight * alpha_scale
+
+        if self.mhc_h_res_mode in DYNAMIC_H_RES_DISABLED_MODES and not self.dynamic_h_res_disabled:
             dynamic_alpha = dynamic_alpha.clone()
             dynamic_alpha[..., self.num_input_views:] = 0.
 

@@ -59,6 +59,7 @@ mhc_admm_step_scale = 1.0  # S-prox-ALM primal step multiplier
 mhc_h_res_init_diag_mass_frac = 1.0 # ALM H_res init: fraction of total mass on diagonal; 1.0 = identity
 mhc_h_res_cap = 1.5 # ALM cap mode: row/column sums are constrained to be <= this value
 mhc_h_res_offdiag_init_scale = 0.05 # identity_tanh_offdiag: initial gamma scale for trainable off-diagonal H_res
+mhc_disable_dynamic_h_res = False # if True, supported static-H_res modes only generate dynamic H_pre parameters
 mhc_log_constraint_errors = False # log projected H_res row/column constraint errors during training
 mhc_constraint_log_interval = 100 # iteration interval for H_res constraint error logging
 mhc_log_h_res_diag_mass = False # log sum(diag(H_res)) / sum(H_res) during training
@@ -292,6 +293,7 @@ model_args = dict(
     mhc_h_res_init_diag_mass_frac=mhc_h_res_init_diag_mass_frac,
     mhc_h_res_cap=mhc_h_res_cap,
     mhc_h_res_offdiag_init_scale=mhc_h_res_offdiag_init_scale,
+    mhc_disable_dynamic_h_res=mhc_disable_dynamic_h_res,
     mhc_adapter_base_streams=mhc_adapter_base_streams,
     mhc_adapter_epsilon=mhc_adapter_epsilon,
     mhc_adapter_cap=mhc_adapter_cap,
@@ -484,8 +486,12 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'mhc_disable_dynamic_h_res']:
+        if k not in checkpoint_model_args:
+            continue
         model_args[k] = checkpoint_model_args[k]
+    if 'mhc_disable_dynamic_h_res' not in checkpoint_model_args:
+        model_args['mhc_disable_dynamic_h_res'] = False
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -500,6 +506,8 @@ elif init_from == 'continue_ckpt':
     for k in model_args:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
+    if 'mhc_disable_dynamic_h_res' not in checkpoint_model_args:
+        model_args['mhc_disable_dynamic_h_res'] = False
     if continue_override_mhc_h_res_mode:
         model_args['mhc_h_res_mode'] = mhc_h_res_mode
         print(f"Overriding checkpoint H_res mode with: {mhc_h_res_mode}")

@@ -2,6 +2,7 @@ hyper_conn_type = "mhc"
 hyper_conn_n = 4
 
 mhc_h_res_mode = "alm_nonnegative_cap"
+mhc_disable_dynamic_h_res = True
 mhc_h_res_cap = 1.5
 mhc_admm_rho = 1.0
 mhc_admm_dual_step = 0.5
