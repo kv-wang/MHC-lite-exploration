@@ -715,7 +715,10 @@ class ManifoldConstrainedHyperConnections(Module):
         )
 
         self.pre_branch_scale = nn.Parameter(torch.ones(1) * 1e-2)
-        self.residual_scale = nn.Parameter(torch.ones(1) * 1e-2)
+        self.residual_scale = nn.Parameter(
+            torch.ones(1) * 1e-2,
+            requires_grad=not self.dynamic_h_res_disabled,
+        )
         if mhc_h_res_mode == "identity_tanh_offdiag":
             self.h_res_offdiag_log_scale = nn.Parameter(
                 torch.tensor(math.log(float(mhc_h_res_offdiag_init_scale)))
