@@ -19,3 +19,12 @@ data/fineweb_edu/modules/
 
 # Large local archives
 *.tar.gz
+
+# log files
+logs/
+*.log
+*.json
+
+# Claude Code files
+CLAUDE.md
+.claude
