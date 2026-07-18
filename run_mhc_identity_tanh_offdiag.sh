@@ -97,11 +97,13 @@ run_streams() {
   )
 
   if [[ "$N_GPUS" -gt 0 ]]; then
-    torchrun --standalone --nproc_per_node="$N_GPUS" train.py "${common_args[@]}"
+    torchrun --standalone --nproc_per_node="$N_GPUS" train.py "${common_args[@]}" "${EXTRA_ARGS[@]}"
   else
-    python train.py "${common_args[@]}"
+    python train.py "${common_args[@]}" "${EXTRA_ARGS[@]}"
   fi
 }
+
+EXTRA_ARGS=("$@")
 
 for n_streams in $STREAMS_LIST; do
   run_streams "$n_streams"
