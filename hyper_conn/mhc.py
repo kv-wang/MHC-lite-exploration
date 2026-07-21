@@ -60,6 +60,7 @@ def make_equal_diag_offdiag_doubly_stochastic(size, diag_mass_frac=1.):
 DYNAMIC_H_RES_DISABLED_MODES = {
     "unconstrained",
     "identity_tanh_offdiag",
+    "identity_clip_offdiag",
     "alm_nonnegative",
     "alm_nonnegative_cap",
     "alm_signed_sprox",
@@ -612,6 +613,7 @@ class ManifoldConstrainedHyperConnections(Module):
         mhc_h_res_init_diag_mass_frac = 1.,
         mhc_h_res_cap = 1.5,
         mhc_h_res_offdiag_init_scale = 0.05,
+        mhc_h_res_offdiag_trainable = True,
         mhc_disable_dynamic_h_res = False,
         mhc_adapter_base_streams = 4,
         mhc_adapter_epsilon = 0.1,
@@ -624,7 +626,7 @@ class ManifoldConstrainedHyperConnections(Module):
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
         """
         super().__init__()
-        valid_h_res_modes = {"sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "unconstrained", "identity_tanh_offdiag", "alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox", "cayley", "adapter_epsilon", "adapter_cap", "adapter_cap_admm"}
+        valid_h_res_modes = {"sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "unconstrained", "identity_tanh_offdiag", "identity_clip_offdiag", "alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox", "cayley", "adapter_epsilon", "adapter_cap", "adapter_cap_admm"}
         if mhc_h_res_mode not in valid_h_res_modes:
             raise ValueError(f"Invalid mhc_h_res_mode: {mhc_h_res_mode}")
         valid_adapter_admm_input_modes = {"raw_logits", "sinkhorn_base_log"}
@@ -706,7 +708,7 @@ class ManifoldConstrainedHyperConnections(Module):
         else:
             init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
             init_alpha0[init_residual_index, :] = 1.
-        if mhc_h_res_mode == "identity_tanh_offdiag":
+        if mhc_h_res_mode in {"identity_tanh_offdiag", "identity_clip_offdiag"}:
             init_alpha1 = torch.zeros((num_residual_streams_fracs, num_residual_streams_fracs))
         elif mhc_h_res_mode in {"unconstrained", "alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox"}:
             init_alpha1 = make_equal_diag_offdiag_doubly_stochastic(
@@ -737,10 +739,12 @@ class ManifoldConstrainedHyperConnections(Module):
             torch.ones(1) * 1e-2,
             requires_grad=not self.dynamic_h_res_disabled,
         )
-        if mhc_h_res_mode == "identity_tanh_offdiag":
-            self.h_res_offdiag_log_scale = nn.Parameter(
-                torch.tensor(math.log(float(mhc_h_res_offdiag_init_scale)))
-            )
+        if mhc_h_res_mode in {"identity_tanh_offdiag", "identity_clip_offdiag"}:
+            offdiag_log_scale = torch.tensor(math.log(float(mhc_h_res_offdiag_init_scale)))
+            if mhc_h_res_offdiag_trainable:
+                self.h_res_offdiag_log_scale = nn.Parameter(offdiag_log_scale)
+            else:
+                self.register_buffer("h_res_offdiag_log_scale", offdiag_log_scale)
 
         # depth connection related (beta)
 
@@ -782,6 +786,7 @@ class ManifoldConstrainedHyperConnections(Module):
         self.mhc_h_res_init_diag_mass_frac = mhc_h_res_init_diag_mass_frac
         self.mhc_h_res_cap = mhc_h_res_cap
         self.mhc_h_res_offdiag_init_scale = mhc_h_res_offdiag_init_scale
+        self.mhc_h_res_offdiag_trainable = mhc_h_res_offdiag_trainable
         self.mhc_disable_dynamic_h_res = mhc_disable_dynamic_h_res
         self.mhc_adapter_base_streams = mhc_adapter_base_streams
         self.mhc_adapter_epsilon = mhc_adapter_epsilon
@@ -839,7 +844,7 @@ class ManifoldConstrainedHyperConnections(Module):
     def _record_h_res_constraint_errors(self, alpha_residual):
         if not self.collect_h_res_constraint_errors:
             return
-        if self.mhc_h_res_mode == "identity_tanh_offdiag":
+        if self.mhc_h_res_mode in {"identity_tanh_offdiag", "identity_clip_offdiag"}:
             return
 
         with torch.no_grad():
@@ -901,7 +906,7 @@ class ManifoldConstrainedHyperConnections(Module):
     def static_h_res(self):
         return self.static_alpha[:, self.num_input_views:]
 
-    def identity_tanh_offdiag_h_res(self, h_res_logits):
+    def identity_offdiag_base(self, h_res_logits):
         n = h_res_logits.shape[-1]
         eye = torch.eye(n, device=h_res_logits.device, dtype=h_res_logits.dtype)
         offdiag_mask = 1. - eye
@@ -914,12 +919,23 @@ class ManifoldConstrainedHyperConnections(Module):
             )
         else:
             gamma = log_scale.to(device=h_res_logits.device, dtype=h_res_logits.dtype).exp()
+        return eye, offdiag_mask, gamma
+
+    def identity_tanh_offdiag_h_res(self, h_res_logits):
+        eye, offdiag_mask, gamma = self.identity_offdiag_base(h_res_logits)
         return eye + gamma * offdiag_mask * h_res_logits.tanh()
+
+    def identity_clip_offdiag_h_res(self, h_res_logits):
+        eye, offdiag_mask, gamma = self.identity_offdiag_base(h_res_logits)
+        clipped_offdiag = torch.maximum(torch.minimum(h_res_logits, gamma), -gamma)
+        return eye + offdiag_mask * clipped_offdiag
 
     def effective_static_h_res(self):
         h_res = self.static_h_res()
         if self.mhc_h_res_mode == "identity_tanh_offdiag":
             return self.identity_tanh_offdiag_h_res(h_res)
+        if self.mhc_h_res_mode == "identity_clip_offdiag":
+            return self.identity_clip_offdiag_h_res(h_res)
         return h_res
 
     def reset_h_res_alm_dual_update_accumulators(self):
@@ -1324,7 +1340,7 @@ class ManifoldConstrainedHyperConnections(Module):
                         alpha_residual = project_admm_l2(alpha_residual)
                 elif self.mhc_h_res_mode == "alm_signed":
                     alpha_residual = self.apply_h_res_alm_loss(alpha_residual)
-                elif self.mhc_h_res_mode == "identity_tanh_offdiag":
+                elif self.mhc_h_res_mode in {"identity_tanh_offdiag", "identity_clip_offdiag"}:
                     alpha_residual = rearrange(
                         alpha_residual,
                         '... f g s t -> ... (f s) (g t)',
@@ -1333,7 +1349,10 @@ class ManifoldConstrainedHyperConnections(Module):
                         s=streams,
                         t=streams,
                     )
-                    alpha_residual = self.identity_tanh_offdiag_h_res(alpha_residual)
+                    if self.mhc_h_res_mode == "identity_tanh_offdiag":
+                        alpha_residual = self.identity_tanh_offdiag_h_res(alpha_residual)
+                    else:
+                        alpha_residual = self.identity_clip_offdiag_h_res(alpha_residual)
                     alpha_residual = rearrange(
                         alpha_residual,
                         '... (f s) (g t) -> ... f g s t',

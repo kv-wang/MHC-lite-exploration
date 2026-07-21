@@ -49,7 +49,7 @@ hyper_conn_expand_stream_mode = "repeat" # "repeat", "split", or "repeat_base_ze
 mhc_gate_fn = "sigmoid"    # "softmax" or "sigmoid" for H_pre/H_post (mhc/mhc_lite only)
 mhc_zero_init_pre_post_logits = False # True = initialize H_pre/H_post static logits to all zeros (mhc only)
 mhc_identity_h_res = False # True = H_res fixed to I, no stream mixing (mhc/mhc_lite only)
-mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "unconstrained", "identity_tanh_offdiag", "alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
+mhc_h_res_mode = "sinkhorn" # "sinkhorn", "admm", "admm_reverse_kl", "admm_reverse_kl_sprox_alm", "admm_l2", "unconstrained", "identity_tanh_offdiag", "identity_clip_offdiag", "alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox", "cayley", "adapter_epsilon", "adapter_cap", or "adapter_cap_admm" for H_res (mhc only)
 mhc_admm_iters = 20        # ADMM steps for H_res when mhc_h_res_mode uses ADMM
 mhc_admm_rho = 1.0         # ADMM penalty for H_res when mhc_h_res_mode uses ADMM
 mhc_admm_dual_step = 0.5   # S-prox-ALM dual update step for S-prox H_res modes
@@ -58,7 +58,8 @@ mhc_admm_smooth_beta = 0.5 # S-prox-ALM auxiliary smoothing factor
 mhc_admm_step_scale = 1.0  # S-prox-ALM primal step multiplier
 mhc_h_res_init_diag_mass_frac = 1.0 # ALM H_res init: fraction of total mass on diagonal; 1.0 = identity
 mhc_h_res_cap = 1.5 # ALM cap mode: row/column sums are constrained to be <= this value
-mhc_h_res_offdiag_init_scale = 0.05 # identity_tanh_offdiag: initial gamma scale for trainable off-diagonal H_res
+mhc_h_res_offdiag_init_scale = 0.05 # identity_*_offdiag: gamma scale for off-diagonal H_res
+mhc_h_res_offdiag_trainable = True # identity_*_offdiag: train gamma if True; fixed gamma if False
 mhc_disable_dynamic_h_res = False # if True, supported static-H_res modes only generate dynamic H_pre parameters
 mhc_log_constraint_errors = False # log projected H_res row/column constraint errors during training
 mhc_constraint_log_interval = 100 # iteration interval for H_res constraint error logging
@@ -145,7 +146,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = False # use PyTorch 2.0 to compile the model to be faster
+compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -293,6 +294,7 @@ model_args = dict(
     mhc_h_res_init_diag_mass_frac=mhc_h_res_init_diag_mass_frac,
     mhc_h_res_cap=mhc_h_res_cap,
     mhc_h_res_offdiag_init_scale=mhc_h_res_offdiag_init_scale,
+    mhc_h_res_offdiag_trainable=mhc_h_res_offdiag_trainable,
     mhc_disable_dynamic_h_res=mhc_disable_dynamic_h_res,
     mhc_adapter_base_streams=mhc_adapter_base_streams,
     mhc_adapter_epsilon=mhc_adapter_epsilon,

@@ -58,7 +58,8 @@ def extract_h_res(static_alpha: torch.Tensor):
 
 def effective_h_res(static_alpha: torch.Tensor, config: dict, state: dict, key: str):
     h = extract_h_res(static_alpha)
-    if config.get("mhc_h_res_mode") != "identity_tanh_offdiag":
+    mode = config.get("mhc_h_res_mode")
+    if mode not in {"identity_tanh_offdiag", "identity_clip_offdiag"}:
         return h
     n = h.shape[0]
     eye = torch.eye(n, dtype=h.dtype, device=h.device)
@@ -71,7 +72,10 @@ def effective_h_res(static_alpha: torch.Tensor, config: dict, state: dict, key: 
     scale_key = key.rsplit(".static_alpha", 1)[0] + ".h_res_offdiag_log_scale"
     if scale_key in state:
         gamma = state[scale_key].detach().float().exp().to(dtype=h.dtype, device=h.device)
-    return eye + gamma * offdiag_mask * h.tanh()
+    if mode == "identity_tanh_offdiag":
+        return eye + gamma * offdiag_mask * h.tanh()
+    clipped_offdiag = torch.maximum(torch.minimum(h, gamma), -gamma)
+    return eye + offdiag_mask * clipped_offdiag
 
 
 def h_res_metrics(h_res: torch.Tensor, sparsity_thresholds: tuple[float, ...]):

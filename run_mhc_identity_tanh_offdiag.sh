@@ -6,6 +6,7 @@
 #   ./run_mhc_identity_tanh_offdiag.sh
 #   N_GPUS=1 MAX_ITERS=100 ./run_mhc_identity_tanh_offdiag.sh
 #   MHC_H_RES_OFFDIAG_INIT_SCALE=0.05 ./run_mhc_identity_tanh_offdiag.sh
+#   MHC_H_RES_OFFDIAG_TRAINABLE=True ./run_mhc_identity_tanh_offdiag.sh
 #   H_RES_GRAD_DUMP_INTERVAL=500 ./run_mhc_identity_tanh_offdiag.sh
 
 set -e
@@ -26,16 +27,17 @@ MAX_ITERS="${MAX_ITERS:-10000}"
 EVAL_ITERS="${EVAL_ITERS:-200}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-200}"
 WANDB_PROJECT="${WANDB_PROJECT:-ablation_num_streams_small}"
-STREAMS_LIST="${STREAMS_LIST:-4}"
+STREAMS_LIST="${STREAMS_LIST:-32}"
 REDUCE_STREAM_MODE="${REDUCE_STREAM_MODE:-score_router_4mean}"
 MHC_H_RES_OFFDIAG_INIT_SCALE="${MHC_H_RES_OFFDIAG_INIT_SCALE:-0.05}"
+MHC_H_RES_OFFDIAG_TRAINABLE="${MHC_H_RES_OFFDIAG_TRAINABLE:-False}"
 WANDB_LOG_H_MATRIX_GRAD_NORM="${WANDB_LOG_H_MATRIX_GRAD_NORM:-True}"
 H_RES_GRAD_DUMP_INTERVAL="${H_RES_GRAD_DUMP_INTERVAL:-500}"
 H_RES_GRAD_DUMP_DIR="${H_RES_GRAD_DUMP_DIR:-}"
 
 echo ""
 echo "================================================================"
-echo " Running large mHC identity-tanh-offdiag training for streams: $STREAMS_LIST"
+echo " Running small mHC identity-tanh-offdiag training for streams: $STREAMS_LIST"
 echo " train_config:  $TRAIN_CONFIG"
 echo " model_config:  $MODEL_CONFIG"
 echo " method_config: $METHOD_CONFIG"
@@ -47,6 +49,7 @@ echo " wandb_project: $WANDB_PROJECT"
 echo " reduce_mode:   $REDUCE_STREAM_MODE"
 echo " h_grad_norms:  $WANDB_LOG_H_MATRIX_GRAD_NORM"
 echo " offdiag_scale: $MHC_H_RES_OFFDIAG_INIT_SCALE"
+echo " gamma_train:   $MHC_H_RES_OFFDIAG_TRAINABLE"
 echo " grad_dump_itv: $H_RES_GRAD_DUMP_INTERVAL"
 echo " grad_dump_dir: ${H_RES_GRAD_DUMP_DIR:-<out_dir>/h_res_gradients}"
 echo "================================================================"
@@ -58,9 +61,15 @@ scale_tag() {
 run_streams() {
   local n_streams="$1"
   local scale_slug
+  local gamma_mode
   scale_slug="$(scale_tag "$MHC_H_RES_OFFDIAG_INIT_SCALE")"
-  local wandb_run_name="mhc-small-mhc-identity-tanh-offdiag-${n_streams}streams-reduce-${REDUCE_STREAM_MODE}-gamma${scale_slug}-${MAX_ITERS}iter"
-  local out_prefix_method="mhc-identity-tanh-offdiag-${n_streams}streams-reduce-${REDUCE_STREAM_MODE}-gamma${scale_slug}-${MAX_ITERS}iter"
+  if [[ "$MHC_H_RES_OFFDIAG_TRAINABLE" == "True" ]]; then
+    gamma_mode="trainable"
+  else
+    gamma_mode="fixed"
+  fi
+  local wandb_run_name="mhc-small-mhc-identity-tanh-offdiag-${n_streams}streams-reduce-${REDUCE_STREAM_MODE}-gamma${scale_slug}-${gamma_mode}-${MAX_ITERS}iter"
+  local out_prefix_method="mhc-identity-tanh-offdiag-${n_streams}streams-reduce-${REDUCE_STREAM_MODE}-gamma${scale_slug}-${gamma_mode}-${MAX_ITERS}iter"
 
   echo ""
   echo "================================================================"
@@ -69,6 +78,7 @@ run_streams() {
   echo " wandb_run_name:    $wandb_run_name"
   echo " out_prefix_method: $out_prefix_method"
   echo " offdiag_scale:     $MHC_H_RES_OFFDIAG_INIT_SCALE"
+  echo " gamma_trainable:   $MHC_H_RES_OFFDIAG_TRAINABLE"
   echo "================================================================"
 
   local common_args=(
@@ -78,6 +88,7 @@ run_streams() {
     --hyper_conn_n="$n_streams"
     --hyper_conn_reduce_stream_mode="$REDUCE_STREAM_MODE"
     --mhc_h_res_offdiag_init_scale="$MHC_H_RES_OFFDIAG_INIT_SCALE"
+    --mhc_h_res_offdiag_trainable="$MHC_H_RES_OFFDIAG_TRAINABLE"
     --max_iters="$MAX_ITERS"
     --eval_iters="$EVAL_ITERS"
     --checkpoint_interval="$CHECKPOINT_INTERVAL"

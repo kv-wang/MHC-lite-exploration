@@ -111,7 +111,7 @@ def projected_h_res(
 
     if mode == "identity":
         return torch.eye(n, dtype=h_res_logits.dtype, device=h_res_logits.device)
-    if mode == "identity_tanh_offdiag":
+    if mode in {"identity_tanh_offdiag", "identity_clip_offdiag"}:
         eye = torch.eye(n, dtype=h_res_logits.dtype, device=h_res_logits.device)
         offdiag_mask = 1. - eye
         gamma = torch.as_tensor(
@@ -126,7 +126,10 @@ def projected_h_res(
                     dtype=h_res_logits.dtype,
                     device=h_res_logits.device,
                 )
-        return eye + gamma * offdiag_mask * h_res_logits.tanh()
+        if mode == "identity_tanh_offdiag":
+            return eye + gamma * offdiag_mask * h_res_logits.tanh()
+        clipped_offdiag = torch.maximum(torch.minimum(h_res_logits, gamma), -gamma)
+        return eye + offdiag_mask * clipped_offdiag
     if mode == "sinkhorn":
         return sinkhorn_knopps(h_res_logits, sinkhorn_iters)
     if mode == "admm_reverse_kl":

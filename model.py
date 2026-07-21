@@ -174,6 +174,7 @@ class GPTConfig:
     mhc_h_res_init_diag_mass_frac: float = 1.0
     mhc_h_res_cap: float = 1.5
     mhc_h_res_offdiag_init_scale: float = 0.05
+    mhc_h_res_offdiag_trainable: bool = True
     mhc_disable_dynamic_h_res: bool = False
     mhc_adapter_base_streams: int = 4
     mhc_adapter_epsilon: float = 0.1
@@ -213,6 +214,7 @@ class GPT(nn.Module):
                 mhc_h_res_init_diag_mass_frac=config.mhc_h_res_init_diag_mass_frac,
                 mhc_h_res_cap=config.mhc_h_res_cap,
                 mhc_h_res_offdiag_init_scale=config.mhc_h_res_offdiag_init_scale,
+                mhc_h_res_offdiag_trainable=config.mhc_h_res_offdiag_trainable,
                 mhc_disable_dynamic_h_res=config.mhc_disable_dynamic_h_res,
                 mhc_adapter_base_streams=config.mhc_adapter_base_streams,
                 mhc_adapter_epsilon=config.mhc_adapter_epsilon,
