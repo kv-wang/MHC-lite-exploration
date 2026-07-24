@@ -23,6 +23,57 @@ import pickle
 from datetime import timedelta
 from contextlib import nullcontext
 
+def _decode_mount_path(path):
+    return path.replace("\\040", " ")
+
+
+def _mount_options_for(path):
+    path = os.path.realpath(path)
+    best_mount = ""
+    best_options = ()
+    try:
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                mount_point = os.path.realpath(_decode_mount_path(parts[1]))
+                if path == mount_point or path.startswith(mount_point.rstrip("/") + "/"):
+                    if len(mount_point) > len(best_mount):
+                        best_mount = mount_point
+                        best_options = tuple(parts[3].split(","))
+    except OSError:
+        return ()
+    return best_options
+
+
+def _is_noexec_path(path):
+    return bool(path) and "noexec" in _mount_options_for(path)
+
+
+def _ensure_torch_compile_cache_env():
+    """Keep torch.compile/Triton generated shared objects off noexec mounts."""
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    cache_base = os.environ.get(
+        "MHC_TORCH_COMPILE_CACHE_BASE",
+        os.path.join(repo_dir, ".torch_compile_cache"),
+    )
+    for env_name, subdir in (
+        ("TMPDIR", "tmp"),
+        ("TORCHINDUCTOR_CACHE_DIR", "torchinductor"),
+        ("TRITON_CACHE_DIR", "triton"),
+    ):
+        current = os.environ.get(env_name, "")
+        if current and not _is_noexec_path(current):
+            os.makedirs(current, exist_ok=True)
+            continue
+        target = os.path.join(cache_base, subdir)
+        os.makedirs(target, exist_ok=True)
+        os.environ[env_name] = target
+
+
+_ensure_torch_compile_cache_env()
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -65,6 +116,8 @@ mhc_log_constraint_errors = False # log projected H_res row/column constraint er
 mhc_constraint_log_interval = 100 # iteration interval for H_res constraint error logging
 mhc_log_h_res_diag_mass = False # log sum(diag(H_res)) / sum(H_res) during training
 mhc_h_res_diag_mass_log_interval = 1000 # iteration interval for H_res diagonal mass logging
+mhc_log_h_res_gamma = False # log identity_*_offdiag gamma values during training
+mhc_h_res_gamma_log_interval = 1000 # iteration interval for H_res gamma logging
 mhc_adapter_ckpt_path = "out-owt-medium-mhc-num-streams-4/ckpt.pt"
 mhc_adapter_base_streams = 4
 mhc_adapter_epsilon = 0.1
@@ -675,6 +728,8 @@ if mhc_log_constraint_errors and mhc_constraint_log_interval < 1:
     raise ValueError("mhc_constraint_log_interval must be >= 1")
 if mhc_log_h_res_diag_mass and mhc_h_res_diag_mass_log_interval < 1:
     raise ValueError("mhc_h_res_diag_mass_log_interval must be >= 1")
+if mhc_log_h_res_gamma and mhc_h_res_gamma_log_interval < 1:
+    raise ValueError("mhc_h_res_gamma_log_interval must be >= 1")
 
 
 def _iter_hc_modules():
@@ -789,6 +844,53 @@ def build_h_res_diag_mass_log(rows):
         log[f"train/h_res_diag_mass/ratio/{key}"] = row["diag_mass_ratio"]
         log[f"train/h_res_diag_mass/diag_sum/{key}"] = row["diag_sum"]
         log[f"train/h_res_diag_mass/total_sum/{key}"] = row["total_sum"]
+    return log
+
+
+def collect_h_res_gammas():
+    rows = []
+    for block_idx, component, hc in _iter_hc_modules():
+        mode = getattr(hc, "mhc_h_res_mode", "")
+        if mode not in {"identity_tanh_offdiag", "identity_clip_offdiag"}:
+            continue
+
+        scale = getattr(hc, "h_res_offdiag_scale", None)
+        log_scale = getattr(hc, "h_res_offdiag_log_scale", None)
+        if scale is not None:
+            gamma_tensor = scale.detach().float()
+            trainable = bool(getattr(scale, "requires_grad", False))
+        elif log_scale is not None:
+            gamma_tensor = log_scale.detach().float().exp()
+            trainable = bool(getattr(log_scale, "requires_grad", False))
+        else:
+            gamma_tensor = torch.as_tensor(float(getattr(hc, "mhc_h_res_offdiag_init_scale", 0.)))
+            trainable = False
+
+        layer_index = block_idx * 2 + (0 if component == "attn" else 1)
+        rows.append({
+            "layer_index": layer_index,
+            "component": component,
+            "gamma": float(gamma_tensor.item()),
+            "trainable": trainable,
+        })
+    return rows
+
+
+def build_h_res_gamma_log(rows):
+    if not rows:
+        return {}
+
+    gammas = [row["gamma"] for row in rows]
+    log = {
+        "train/h_res_gamma/mean": float(np.mean(gammas)),
+        "train/h_res_gamma/min": float(np.min(gammas)),
+        "train/h_res_gamma/max": float(np.max(gammas)),
+        "train/h_res_gamma/count": len(rows),
+        "train/h_res_gamma/trainable_count": sum(1 for row in rows if row["trainable"]),
+    }
+    for row in rows:
+        key = f"layer_{row['layer_index']}_{row['component']}"
+        log[f"train/h_res_gamma/value/{key}"] = row["gamma"]
     return log
 
 
@@ -1490,6 +1592,24 @@ while True:
             )
             if wandb_log:
                 wandb.log(h_res_diag_mass_log, step=iter_num)
+
+    h_res_gamma_log = None
+    log_h_res_gamma_this_iter = (
+        mhc_log_h_res_gamma
+        and _has_hc_modules
+        and iter_num % mhc_h_res_gamma_log_interval == 0
+    )
+    if log_h_res_gamma_this_iter and master_process:
+        h_res_gamma_log = build_h_res_gamma_log(collect_h_res_gammas())
+        if h_res_gamma_log:
+            print(
+                f"[iter {iter_num}] h_res gamma "
+                f"mean: {h_res_gamma_log['train/h_res_gamma/mean']:.6g}, "
+                f"min: {h_res_gamma_log['train/h_res_gamma/min']:.6g}, "
+                f"max: {h_res_gamma_log['train/h_res_gamma/max']:.6g}"
+            )
+            if wandb_log:
+                wandb.log(h_res_gamma_log, step=iter_num)
 
     tpss.append(tokens_per_sec)
     train_losses.append(float(loss.detach()))

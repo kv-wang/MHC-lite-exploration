@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# Train large mHC identity+tanh-offdiag H_res with fixed gamma, n_streams=4.
+# Train large mHC identity+tanh-offdiag H_res with trainable gamma, n_streams=4.
 #
 # Usage:
 #   ./run_mhc_identity_tanh_offdiag_large_4.sh
 #   N_GPUS=4 MAX_ITERS=100 ./run_mhc_identity_tanh_offdiag_large_4.sh
 #   MHC_H_RES_OFFDIAG_INIT_SCALE=0.05 ./run_mhc_identity_tanh_offdiag_large_4.sh
+#   MHC_H_RES_OFFDIAG_TRAINABLE=True ./run_mhc_identity_tanh_offdiag_large_4.sh
+#   MHC_LOG_H_RES_GAMMA=True MHC_H_RES_GAMMA_LOG_INTERVAL=500 ./run_mhc_identity_tanh_offdiag_large_4.sh
 
 set -e
 
@@ -27,16 +29,17 @@ CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-200}"
 WANDB_PROJECT="${WANDB_PROJECT:-ablation_num_streams_large}"
 STREAMS_LIST="${STREAMS_LIST:-4}"
 REDUCE_STREAM_MODE="${REDUCE_STREAM_MODE:-4mean}"
-MHC_H_RES_OFFDIAG_INIT_SCALE="${MHC_H_RES_OFFDIAG_INIT_SCALE:-0.05}"
-# Fixed gamma for this script.
-MHC_H_RES_OFFDIAG_TRAINABLE="${MHC_H_RES_OFFDIAG_TRAINABLE:-False}"
+MHC_H_RES_OFFDIAG_INIT_SCALE="${MHC_H_RES_OFFDIAG_INIT_SCALE:-0.0001}"
+MHC_H_RES_OFFDIAG_TRAINABLE="${MHC_H_RES_OFFDIAG_TRAINABLE:-True}"
 WANDB_LOG_H_MATRIX_GRAD_NORM="${WANDB_LOG_H_MATRIX_GRAD_NORM:-True}"
 H_RES_GRAD_DUMP_INTERVAL="${H_RES_GRAD_DUMP_INTERVAL:-500}"
 H_RES_GRAD_DUMP_DIR="${H_RES_GRAD_DUMP_DIR:-}"
+MHC_LOG_H_RES_GAMMA="${MHC_LOG_H_RES_GAMMA:-True}"
+MHC_H_RES_GAMMA_LOG_INTERVAL="${MHC_H_RES_GAMMA_LOG_INTERVAL:-500}"
 
 echo ""
 echo "================================================================"
-echo " Running large mHC identity-tanh-offdiag (fixed gamma)"
+echo " Running large mHC identity-tanh-offdiag (trainable gamma)"
 echo " streams:       $STREAMS_LIST"
 echo " train_config:  $TRAIN_CONFIG"
 echo " model_config:  $MODEL_CONFIG"
@@ -50,6 +53,8 @@ echo " reduce_mode:   $REDUCE_STREAM_MODE"
 echo " h_grad_norms:  $WANDB_LOG_H_MATRIX_GRAD_NORM"
 echo " offdiag_scale: $MHC_H_RES_OFFDIAG_INIT_SCALE"
 echo " gamma_train:   $MHC_H_RES_OFFDIAG_TRAINABLE"
+echo " gamma_log:     $MHC_LOG_H_RES_GAMMA"
+echo " gamma_log_itv: $MHC_H_RES_GAMMA_LOG_INTERVAL"
 echo " grad_dump_itv: $H_RES_GRAD_DUMP_INTERVAL"
 echo " grad_dump_dir: ${H_RES_GRAD_DUMP_DIR:-<out_dir>/h_res_gradients}"
 echo "================================================================"
@@ -62,7 +67,12 @@ run_streams() {
   local n_streams="$1"
   local scale_slug
   scale_slug="$(scale_tag "$MHC_H_RES_OFFDIAG_INIT_SCALE")"
-  local gamma_mode="fixed"
+  local gamma_mode
+  if [[ "$MHC_H_RES_OFFDIAG_TRAINABLE" == "True" ]]; then
+    gamma_mode="trainable"
+  else
+    gamma_mode="fixed"
+  fi
   local wandb_run_name="mhc-large-mhc-identity-tanh-offdiag-${n_streams}streams-reduce-${REDUCE_STREAM_MODE}-gamma${scale_slug}-${gamma_mode}-${MAX_ITERS}iter"
   local out_prefix_method="mhc-identity-tanh-offdiag-${n_streams}streams-reduce-${REDUCE_STREAM_MODE}-gamma${scale_slug}-${gamma_mode}-${MAX_ITERS}iter"
 
@@ -74,6 +84,8 @@ run_streams() {
   echo " out_prefix_method: $out_prefix_method"
   echo " offdiag_scale:     $MHC_H_RES_OFFDIAG_INIT_SCALE"
   echo " gamma_trainable:   $MHC_H_RES_OFFDIAG_TRAINABLE"
+  echo " gamma_log:         $MHC_LOG_H_RES_GAMMA"
+  echo " gamma_log_interval: $MHC_H_RES_GAMMA_LOG_INTERVAL"
   echo "================================================================"
 
   local common_args=(
@@ -100,6 +112,8 @@ run_streams() {
     --wandb_log_layer_activation_norm=False
     --wandb_log_layer_activation_grad_norm=False
     --mhc_log_constraint_errors=False
+    --mhc_log_h_res_gamma="$MHC_LOG_H_RES_GAMMA"
+    --mhc_h_res_gamma_log_interval="$MHC_H_RES_GAMMA_LOG_INTERVAL"
   )
 
   if [[ "$N_GPUS" -gt 0 ]]; then
@@ -117,5 +131,5 @@ done
 
 echo ""
 echo "================================================================"
-echo " large mHC identity-tanh-offdiag (fixed gamma, n=4) training completed"
+echo " large mHC identity-tanh-offdiag (trainable gamma, n=4) training completed"
 echo "================================================================"

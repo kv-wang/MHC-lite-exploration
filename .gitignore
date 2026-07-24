@@ -11,6 +11,7 @@ input.txt
 env/
 venv/
 wandb
+.torch_compile_cache/
 
 # Local dataset caches and downloads
 data/fineweb_edu/HuggingFaceFW___fineweb-edu/
