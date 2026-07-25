@@ -1204,7 +1204,11 @@ class ManifoldConstrainedHyperConnections(Module):
             alpha_scale = cat((pre_branch_scale, residual_scale))
             dynamic_alpha = wc_weight * alpha_scale
 
-        if self.mhc_h_res_mode in DYNAMIC_H_RES_DISABLED_MODES and not self.dynamic_h_res_disabled:
+        if (self.mhc_h_res_mode in DYNAMIC_H_RES_DISABLED_MODES and not self.dynamic_h_res_disabled) or self.mhc_identity_h_res:
+            # When identity_h_res is set, zero the dynamic H_res columns so the
+            # compiled graph has no dead code.  torch.compile would otherwise
+            # eliminate the dead H_res computation, which changes kernel/fusion
+            # decisions for the live H_pre path and degrades training loss.
             dynamic_alpha = dynamic_alpha.clone()
             dynamic_alpha[..., self.num_input_views:] = 0.
 
