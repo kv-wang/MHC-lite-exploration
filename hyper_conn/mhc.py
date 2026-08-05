@@ -1229,7 +1229,27 @@ class ManifoldConstrainedHyperConnections(Module):
         else:
             alpha_pre = alpha_pre.sigmoid()
 
-        if self.mhc_identity_h_res:
+        forced_h_res = getattr(self, "_kkt_forced_h_res", None)
+        if forced_h_res is not None:
+            streams = self.num_residual_streams
+            target_shape = alpha_residual.shape
+            forced_h_res = forced_h_res.to(device=alpha_residual.device, dtype=alpha_residual.dtype)
+            if forced_h_res.ndim == 2:
+                forced_h_res = rearrange(
+                    forced_h_res,
+                    '(f1 s1) (f2 s2) -> f1 s1 f2 s2',
+                    f1=self.num_fracs,
+                    s1=streams,
+                    f2=self.num_fracs,
+                    s2=streams,
+                )
+            elif forced_h_res.ndim != 4:
+                raise ValueError(
+                    "_kkt_forced_h_res must be a 2D matrix or a 4D "
+                    "(frac, stream, frac, stream) tensor"
+                )
+            alpha_residual = forced_h_res.expand(target_shape)
+        elif self.mhc_identity_h_res:
             streams = self.num_residual_streams
             target_shape = alpha_residual.shape
             alpha_residual = torch.eye(
