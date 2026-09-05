@@ -1,0 +1,1048 @@
+\documentclass[UTF8,11pt]{ctexart}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue]{hyperref}
+
+\title{为什么 mHC 的 $H_{\mathrm{res}}$ 换成 Identity 或 Identity-offdiag 可能更好}
+\author{}
+\date{2026-08-31}
+
+\newtheorem{proposition}{命题}
+\newtheorem{claim}{结论}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\one}{\mathbf{1}}
+\newcommand{\Birkhoff}{\mathcal{B}_n}
+\newcommand{\J}{J_n}
+\newcommand{\Hres}{H^{\mathrm{res}}}
+\newcommand{\Hpre}{H^{\mathrm{pre}}}
+\newcommand{\Hpost}{H^{\mathrm{post}}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+核心观点：双随机 $\Hres$ 可以防止 residual path 爆炸，但一般的非置换双随机矩阵会收缩 stream 差异方向。多层连乘后，$\prod_l \Hres_l$ 可能趋向均匀混合 $\J=\one\one^T/n$。从层间 attention 矩阵看，$\Hres$ 只是在 $H^{\mathrm{pre}}$ 与 $H^{\mathrm{post}}$ 之间形成中间传播核。Identity 给出稳定的 factorized layer-attention kernel，其表达能力可由 rank、奇异值能量和动态 kernel family 定量刻画。Identity-offdiag 进一步保留单位主干，并加入小的有符号 path corrections。
+\end{abstract}
+
+\section{问题}
+
+mHC 的 residual mixing 写作
+\begin{equation}
+  \Hres_l \in \R^{n\times n}.
+\end{equation}
+常见做法是用 Sinkhorn 将其约束为双随机矩阵。实验现象是：令
+\begin{equation}
+  \Hres_l = I
+\end{equation}
+有时反而更好。需要解释的是：为什么去掉 learned residual mixing 不一定损失表达能力，反而可能优化更好。
+进一步的问题是：为什么在 identity 上加入小的 offdiag 修正，也可能比 pure identity 更好。
+
+\section{简化的 mHC 更新}
+
+令第 $l$ 层有 $n$ 个 residual streams：
+\begin{equation}
+  X_l = [x_{l,1},\dots,x_{l,n}]^T \in \R^{n\times C}.
+\end{equation}
+
+简化写法：
+\begin{equation}
+  X_{l+1}
+  =
+  \Hres_l X_l
+  +
+  \Hpost_l(X_l)^T
+  f_l\!\left(\Hpre_l(X_l)X_l;W_l\right).
+  \label{eq:mhc-update}
+\end{equation}
+
+只看 residual highway：
+\begin{equation}
+  X_L^{\mathrm{res}}
+  =
+  \left(\prod_{l=0}^{L-1}\Hres_l\right)X_0.
+  \label{eq:res-product}
+\end{equation}
+
+所以 $\Hres_l$ 的影响会随深度累积。
+
+\section{层间 Attention 矩阵视角}
+
+博客的一个关键观察是：HC/mHC 可以展开成层间 attention。先忽略 $\Hpre,\Hpost$ 的输入依赖，写作
+\begin{equation}
+  X_t=
+  H_t^{\mathrm{res}}X_{t-1}
+  +
+  H_t^{\mathrm{post}}y_t,
+  \qquad
+  y_t=
+  f_t(H_t^{\mathrm{pre}}X_{t-1}).
+\end{equation}
+
+定义 residual 连乘
+\begin{equation}
+  H_{t\leftarrow s}^{\mathrm{res}}
+  =
+  H_t^{\mathrm{res}}H_{t-1}^{\mathrm{res}}\cdots H_s^{\mathrm{res}},
+  \qquad
+  H_{t\leftarrow t+1}^{\mathrm{res}}=I.
+\end{equation}
+
+把递推展开，可得
+\begin{equation}
+  X_t=
+  \sum_{s=0}^{t}
+  H_{t\leftarrow s+1}^{\mathrm{res}}
+  H_s^{\mathrm{post}}y_s.
+\end{equation}
+
+于是下一层 branch input 为
+\begin{equation}
+  y_{t+1}
+  =
+  f_{t+1}\left(
+  \sum_{s=0}^{t}
+  a_{t+1,s}y_s
+  \right),
+\end{equation}
+其中
+\begin{equation}
+  a_{t+1,s}
+  =
+  H_{t+1}^{\mathrm{pre}}
+  H_{t\leftarrow s+1}^{\mathrm{res}}
+  H_s^{\mathrm{post}}.
+\end{equation}
+
+若 $H_{t+1}^{\mathrm{pre}}\in\R^{1\times n}$，$H_s^{\mathrm{post}}\in\R^{n\times 1}$，则 $a_{t+1,s}$ 是标量。所有 $a_{t,s}$ 组成一张下三角层间 attention 矩阵：
+\begin{equation}
+  A=
+  \begin{bmatrix}
+  a_{1,0} & 0 & 0 & \cdots \\
+  a_{2,0} & a_{2,1} & 0 & \cdots \\
+  a_{3,0} & a_{3,1} & a_{3,2} & \cdots \\
+  \vdots & \vdots & \vdots & \ddots
+  \end{bmatrix}.
+\end{equation}
+
+因此 mHC 的核心不是单独的 $\Hres$，而是
+\begin{equation}
+  A_{t+1,s}
+  =
+  H_{t+1}^{\mathrm{pre}}
+  \left(\prod_{r=s+1}^{t}H_r^{\mathrm{res}}\right)
+  H_s^{\mathrm{post}}.
+\end{equation}
+
+双随机 $\Hres$ 的作用是让中间乘积稳定；但若该乘积趋向 $\J$，则
+\begin{equation}
+  A_{t+1,s}
+  \approx
+  H_{t+1}^{\mathrm{pre}}\J H_s^{\mathrm{post}},
+\end{equation}
+层间 attention 会经过一个 rank-one stream bottleneck。
+
+若 $H_r^{\mathrm{res}}=I$，则
+\begin{equation}
+  A_{t+1,s}
+  =
+  H_{t+1}^{\mathrm{pre}}H_s^{\mathrm{post}}.
+\end{equation}
+
+所以 identity 不是删除层间 attention，而是得到一个稳定的 factorized layer-attention kernel。动态 $\Hpre$ 和 $\Hpost$ 仍然决定每层读哪些历史信息、写回哪些 stream。
+
+若 $H_r^{\mathrm{res}}=I+E_r$，则
+\begin{equation}
+  A_{t+1,s}
+  =
+  H_{t+1}^{\mathrm{pre}}
+  \left(\prod_{r=s+1}^{t}(I+E_r)\right)
+  H_s^{\mathrm{post}}.
+\end{equation}
+当 $E_r$ 较小时，
+\begin{equation}
+  A_{t+1,s}
+  \approx
+  H_{t+1}^{\mathrm{pre}}H_s^{\mathrm{post}}
+  +
+  \sum_{r=s+1}^{t}
+  H_{t+1}^{\mathrm{pre}}E_rH_s^{\mathrm{post}}
+  +O(E^2).
+\end{equation}
+
+因此 identity-offdiag 可以理解为
+\begin{equation}
+  \text{factorized layer attention}
+  +
+  \text{small path corrections}.
+\end{equation}
+它保留 identity 的稳定主干，同时让 residual path 提供额外的跨 stream 路径修正。
+
+\section{双随机约束}
+
+Birkhoff polytope 定义为
+\begin{equation}
+  \Birkhoff
+  =
+  \left\{
+  H\in\R^{n\times n}: H\one=\one,\ \one^T H=\one^T,\ H_{ij}\ge 0
+  \right\}.
+\end{equation}
+
+若 $H\in\Birkhoff$，则均值方向不变：
+\begin{equation}
+  H\one=\one.
+\end{equation}
+
+令
+\begin{equation}
+  \mathcal{U}=\{v\in\R^n:\one^T v=0\}.
+\end{equation}
+则 $\mathcal{U}$ 是不变子空间：
+\begin{equation}
+  v\in\mathcal{U}
+  \quad\Rightarrow\quad
+  \one^T Hv=(\one^T H)v=\one^T v=0.
+\end{equation}
+
+因此任意 stream 向量可分解为
+\begin{equation}
+  x = \bar{x}\one + x_\perp,
+  \qquad
+  x_\perp\in\mathcal{U}.
+\end{equation}
+双随机矩阵保留 $\bar{x}\one$，但可能收缩 $x_\perp$。
+
+\section{稳定性}
+
+\begin{proposition}
+若 $H\in\Birkhoff$，则
+\begin{equation}
+  \norm{H}_2=1.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Birkhoff--von Neumann 定理给出
+\begin{equation}
+  H=\sum_k \alpha_k P_k,
+  \qquad
+  \alpha_k\ge 0,
+  \qquad
+  \sum_k\alpha_k=1,
+\end{equation}
+其中 $P_k$ 是 permutation matrix，故 $\norm{P_k}_2=1$。于是
+\begin{equation}
+  \norm{H}_2
+  \le
+  \sum_k\alpha_k\norm{P_k}_2
+  =1.
+\end{equation}
+又因 $H\one=\one$，取 $u=\one/\sqrt n$ 有 $Hu=u$，所以 $\norm{H}_2\ge1$。故 $\norm{H}_2=1$。
+\end{proof}
+
+这说明双随机 $\Hres$ 防止最大范数爆炸，但不保证所有方向无损。
+
+\section{Dobrushin 收缩}
+
+对 row-stochastic 矩阵 $P$，定义
+\begin{equation}
+  \tau(P)
+  =
+  \frac12\max_{i,k}\sum_j |P_{ij}-P_{kj}|.
+\end{equation}
+
+等价地，
+\begin{equation}
+  \tau(P)
+  =
+  1-
+  \min_{i,k}\sum_j \min(P_{ij},P_{kj}).
+\end{equation}
+
+若 $P_{ij}\ge\delta>0$，则任意两行重叠至少为 $n\delta$，所以
+\begin{equation}
+  \tau(P)\le 1-n\delta<1.
+\end{equation}
+
+又有次乘性
+\begin{equation}
+  \tau(PQ)\le \tau(P)\tau(Q).
+\end{equation}
+
+因此，若 $H_l\in\Birkhoff$ 且 $(H_l)_{ij}\ge\delta>0$，则
+\begin{equation}
+  \tau(H_{L-1}\cdots H_0)
+  \le
+  (1-n\delta)^L
+  \to 0.
+\end{equation}
+
+\begin{claim}
+严格正双随机矩阵的深层连乘会让所有行趋同。因为乘积仍是双随机矩阵，极限只能是
+\begin{equation}
+  \J=\frac1n\one\one^T.
+\end{equation}
+\end{claim}
+
+对 $n=4$，
+\begin{equation}
+  \J
+  =
+  \begin{bmatrix}
+  .25&.25&.25&.25\\
+  .25&.25&.25&.25\\
+  .25&.25&.25&.25\\
+  .25&.25&.25&.25
+  \end{bmatrix}.
+\end{equation}
+
+这就是 residual streams 被平均化的数学形式。
+
+\section{谱视角}
+
+令
+\begin{equation}
+  P_\parallel=\J,
+  \qquad
+  P_\perp=I-\J.
+\end{equation}
+
+双随机矩阵满足
+\begin{equation}
+  H\J=\J,
+  \qquad
+  \J H=\J.
+\end{equation}
+因此
+\begin{equation}
+  H=\J+P_\perp H P_\perp.
+\end{equation}
+
+差异方向由
+\begin{equation}
+  Q=P_\perp H P_\perp|_{\mathcal{U}}
+\end{equation}
+控制。若每层 $\norm{Q_l}_2\le q<1$，则
+\begin{equation}
+  \norm{Q_{L-1}\cdots Q_0}_2\le q^L.
+\end{equation}
+
+例如
+\begin{equation}
+  q=0.49,
+  \qquad
+  L=56,
+  \qquad
+  q^L\approx 5.1\times 10^{-18}.
+\end{equation}
+
+所以即使每层只轻微混合，深层连乘也可能几乎抹掉 stream 差异方向。
+
+\section{Identity 的性质}
+
+Identity 本身属于 Birkhoff polytope：
+\begin{equation}
+  I\one=\one,
+  \qquad
+  \one^T I=\one^T,
+  \qquad
+  I_{ij}\ge0.
+\end{equation}
+
+但它没有收缩：
+\begin{equation}
+  I^L=I,
+  \qquad
+  Ix=x.
+\end{equation}
+
+因此
+\begin{equation}
+  X_L^{\mathrm{res}}=X_0.
+\end{equation}
+
+Identity 同时满足
+\begin{equation}
+  \sigma_{\max}(I)=1,
+  \qquad
+  \sigma_{\min}(I)=1,
+  \qquad
+  \kappa(I)=1.
+\end{equation}
+
+而若 $H_{L-1}\cdots H_0\to\J$，则
+\begin{equation}
+  \mathrm{rank}(\J)=1,
+  \qquad
+  \sigma_{\min}\to0.
+\end{equation}
+
+所以双随机 learned $\Hres$ 是 ``不爆炸''；identity 是 ``不爆炸且不丢失差异方向''。
+
+\section{Channel strength}
+
+第 $i$ 层 branch output 到第 $j$ 层 branch input 的有效通道可写成
+\begin{equation}
+  c_{ij}
+  =
+  h_j^{\mathrm{pre}}
+  \left(\prod_{k=i+1}^{j-1}H_k^{\mathrm{res}}\right)
+  h_i^{\mathrm{post},T}.
+\end{equation}
+
+若中间乘积塌缩到 $\J$，则
+\begin{equation}
+  c_{ij}
+  \approx
+  h_j^{\mathrm{pre}}\J h_i^{\mathrm{post},T}.
+\end{equation}
+此时只保留均值方向。
+
+若 $H_k^{\mathrm{res}}=I$，则
+\begin{equation}
+  c_{ij}
+  =
+  h_j^{\mathrm{pre}} I h_i^{\mathrm{post},T}
+  =
+  h_j^{\mathrm{pre}}h_i^{\mathrm{post},T}.
+\end{equation}
+
+所以 identity 不削弱跨层通道；它只是去掉中间 residual mixing 的衰减项。
+
+\section{表达能力的定量刻画}
+
+在 identity 情况下，令
+\begin{equation}
+  p_j=h_j^{\mathrm{pre}}\in\R^{1\times n},
+  \qquad
+  q_i=h_i^{\mathrm{post}}\in\R^{1\times n}.
+\end{equation}
+则
+\begin{equation}
+  c_{ij}=p_jq_i^T.
+\end{equation}
+
+把所有 source layer $i$ 和 target layer $j$ 的通道强度排成矩阵 $C$：
+\begin{equation}
+  C_{ji}=c_{ij}.
+\end{equation}
+令
+\begin{equation}
+  P=
+  \begin{bmatrix}
+  p_1\\
+  p_2\\
+  \vdots\\
+  p_T
+  \end{bmatrix}
+  \in\R^{T\times n},
+  \qquad
+  Q=
+  \begin{bmatrix}
+  q_1\\
+  q_2\\
+  \vdots\\
+  q_T
+  \end{bmatrix}
+  \in\R^{T\times n}.
+\end{equation}
+则
+\begin{equation}
+  C=PQ^T,
+  \qquad
+  \mathrm{rank}(C)
+  \le
+  n.
+\end{equation}
+
+所以 $n$ 个 residual streams 对应一个 rank-$n$ 的层间 attention capacity。Identity 不表示没有跨层通信；它表示跨层通信核被约束为低秩双线性分解。
+
+更强地说，任意目标层间通道矩阵 $A\in\R^{T\times T}$，只要
+\begin{equation}
+  \mathrm{rank}(A)\le n,
+\end{equation}
+就存在
+\begin{equation}
+  A=UV^T,
+  \qquad
+  U,V\in\R^{T\times n}.
+\end{equation}
+取
+\begin{equation}
+  p_j=U_{j,:},
+  \qquad
+  q_i=V_{i,:},
+\end{equation}
+即可得到
+\begin{equation}
+  c_{ij}=p_jq_i^T=A_{ji}.
+\end{equation}
+
+因此 identity 可以精确表示所有 rank 不超过 $n$ 的层间 attention 矩阵。
+
+若目标 $A$ 是高秩矩阵，则 identity 对应最佳 rank-$n$ 近似问题：
+\begin{equation}
+  \min_{\mathrm{rank}(C)\le n}
+  \norm{A-C}_F^2.
+\end{equation}
+由 Eckart--Young 定理，若 $\sigma_k(A)$ 是 $A$ 的奇异值，则
+\begin{equation}
+  \min_{\mathrm{rank}(C)\le n}
+  \norm{A-C}_F^2
+  =
+  \sum_{k>n}\sigma_k(A)^2.
+\end{equation}
+
+可用 explained spectral energy 衡量 $n$ 个 streams 捕获的通信能量：
+\begin{equation}
+  \mathrm{Energy}_n(A)
+  =
+  \frac{
+  \sum_{k=1}^{n}\sigma_k(A)^2
+  }{
+  \sum_{k=1}^{T}\sigma_k(A)^2
+  }.
+\end{equation}
+如果 $\mathrm{Energy}_n(A)\approx1$，则 $n$ 个 streams 已经足够表达主要层间通信结构。
+
+也可以用 effective rank 衡量目标通信是否本质低秩。令
+\begin{equation}
+  p_k=
+  \frac{\sigma_k(A)^2}{\sum_r\sigma_r(A)^2},
+\end{equation}
+定义
+\begin{equation}
+  r_{\mathrm{eff}}(A)
+  =
+  \exp\left(-\sum_k p_k\log p_k\right).
+\end{equation}
+若
+\begin{equation}
+  r_{\mathrm{eff}}(A)\le n,
+\end{equation}
+则 identity 的 rank-$n$ kernel 在维度上已经匹配目标通信的有效复杂度。
+
+动态路由进一步增强表达力。若
+\begin{equation}
+  p_j=p_j(X),
+  \qquad
+  q_i=q_i(X),
+\end{equation}
+则
+\begin{equation}
+  C(X)=P(X)Q(X)^T.
+\end{equation}
+此时模型不是学习一个固定低秩矩阵，而是学习一个输入相关的低秩 kernel family：
+\begin{equation}
+  \mathcal{C}
+  =
+  \{X\mapsto P(X)Q(X)^T\}.
+\end{equation}
+
+所以 identity 的表达能力可由四个量定量理解：
+\begin{equation}
+  \mathrm{rank}(C)\le n,
+  \qquad
+  \sum_{k>n}\sigma_k(A)^2,
+  \qquad
+  \mathrm{Energy}_n(A),
+  \qquad
+  r_{\mathrm{eff}}(A).
+\end{equation}
+
+相比之下，若 learned 双随机 residual mixing 的中间乘积趋向 $\J$，则
+\begin{equation}
+  c_{ij}
+  \approx
+  h_j^{\mathrm{pre}}\J h_i^{\mathrm{post},T}
+  =
+  \frac{1}{n}
+  (h_j^{\mathrm{pre}}\one)
+  (\one^T h_i^{\mathrm{post},T}).
+\end{equation}
+这近似为
+\begin{equation}
+  c_{ij}\approx a_jb_i,
+\end{equation}
+即 rank-$1$ 层间通道。形式上 learned $\Hres$ 更复杂，但深层连乘后可能把 $n$ 维 stream inner product 压缩成均值方向。
+
+\section{为什么仍有表达能力}
+
+在 identity 设定下，式~\eqref{eq:mhc-update} 变成
+\begin{equation}
+  X_{l+1}
+  =
+  X_l
+  +
+  \Hpost_l(X_l)^T
+  f_l\!\left(\Hpre_l(X_l)X_l;W_l\right).
+\end{equation}
+
+其中 $\Hpre_l(X_l)$ 和 $\Hpost_l(X_l)$ 是输入相关的动态路由。写成分量形式：
+\begin{equation}
+  \tilde{x}_l
+  =
+  \sum_{s=1}^n h_{l,s}^{\mathrm{pre}}(X_l)x_{l,s},
+\end{equation}
+\begin{equation}
+  x_{l+1,s}
+  =
+  x_{l,s}
+  +
+  h_{l,s}^{\mathrm{post}}(X_l) f_l(\tilde{x}_l;W_l).
+\end{equation}
+
+因此跨 stream 交互由三部分完成：
+\begin{equation}
+  \text{动态读取 } \Hpre
+  \quad + \quad
+  \text{非线性变换 } f_l
+  \quad + \quad
+  \text{动态写回 } \Hpost.
+\end{equation}
+
+Identity 只固定 residual highway：
+\begin{equation}
+  \text{residual path}=I.
+\end{equation}
+它不固定 $\Hpre$、$\Hpost$ 或 $f_l$。所以表达能力仍然充足。
+
+\section{Identity-offdiag 的优势}
+
+Identity-offdiag 可写成
+\begin{equation}
+  \Hres_l=I+E_l,
+  \qquad
+  (E_l)_{ii}=0.
+\end{equation}
+
+代码中的两种形式分别为
+\begin{equation}
+  E_l=
+  \gamma_l(\one\one^T-I)\odot\tanh(A_l),
+\end{equation}
+或
+\begin{equation}
+  E_l=
+  (\one\one^T-I)\odot\mathrm{clip}(A_l,-\gamma_l,\gamma_l).
+\end{equation}
+
+因此 residual path 变成
+\begin{equation}
+  X_{l+1}^{\mathrm{res}}
+  =
+  (I+E_l)X_l
+  =
+  X_l+E_lX_l.
+\end{equation}
+
+Pure identity 只有无损传输；identity-offdiag 在不改变 diagonal self highway 的同时，加入小的有符号跨 stream 通信：
+\begin{equation}
+  (E_lX_l)_i
+  =
+  \sum_{j\ne i}(E_l)_{ij}x_{l,j}.
+\end{equation}
+
+它因此位于两者之间：
+\begin{equation}
+  \text{identity: } I,
+  \qquad
+  \text{identity-offdiag: } I+E,
+  \qquad
+  \text{Sinkhorn: positive mixing } H.
+\end{equation}
+
+需要注意，一般的 $I+E_l$ 不严格双随机：
+\begin{equation}
+  (I+E_l)\one=
+  \one+E_l\one,
+  \qquad
+  \one^T(I+E_l)=
+  \one^T+\one^TE_l.
+\end{equation}
+只有 $E_l\one=0$ 且 $\one^TE_l=0$ 时，它才保留精确的双随机方向。其主要优势不是精确投影，而是 identity-centered signed perturbation。
+
+\subsection*{Dobrushin 角度}
+
+对非负 row-stochastic 矩阵 $P$，Dobrushin 系数满足
+\begin{equation}
+  \tau(PQ)
+  \le
+  \tau(P)\tau(Q).
+\end{equation}
+
+如果每层都有严格正 overlap，即 $P_{ij}\ge\delta>0$，则
+\begin{equation}
+  \tau(P_l)
+  \le
+  1-n\delta
+  <1,
+\end{equation}
+从而
+\begin{equation}
+  \tau(P_{L-1}\cdots P_0)
+  \le
+  (1-n\delta)^L
+  \to 0.
+\end{equation}
+
+这就是双随机 Sinkhorn 矩阵深层连乘后行趋同的原因：每层都在做非负凸平均，差异方向被重复收缩。
+
+Identity 的情况为
+\begin{equation}
+  \tau(I)=1,
+\end{equation}
+没有 Dobrushin 收缩。若把一类 identity-centered stochastic mixing 写作
+\begin{equation}
+  P_l=(1-\alpha_l)I+\alpha_l B_l,
+\end{equation}
+其中 $B_l$ row-stochastic，则
+\begin{equation}
+  \tau(P_l)
+  \le
+  (1-\alpha_l)+\alpha_l\tau(B_l)
+  =
+  1-\alpha_l(1-\tau(B_l)).
+\end{equation}
+
+于是
+\begin{equation}
+  \prod_l \tau(P_l)
+  \lesssim
+  \exp\left(
+  -\sum_l\alpha_l(1-\tau(B_l))
+  \right).
+\end{equation}
+
+当总 mixing strength
+\begin{equation}
+  \sum_l\alpha_l(1-\tau(B_l))
+\end{equation}
+较小时，行趋同会显著变慢。
+
+Identity-offdiag 更进一步：
+\begin{equation}
+  H_l=I+E_l
+\end{equation}
+通常不是非负 row-stochastic 矩阵，$E_l$ 还可以带符号。因此标准 Dobrushin--Markov 收缩结论不能直接套用。换句话说，它避免了 Sinkhorn 的系统性机制：
+\begin{equation}
+  \text{positive averaging}
+  \Rightarrow
+  \tau<1
+  \Rightarrow
+  \prod_l H_l \to \J.
+\end{equation}
+
+所以 identity-offdiag 能有效避免的是 ``由非负平均导致的必然行趋同''。它不能保证任意 $E_l$ 都稳定；稳定性仍取决于 $E_l$ 的大小和谱性质。
+
+对跨层 channel strength，identity-offdiag 给出
+\begin{equation}
+  c_{ij}
+  =
+  h_j^{\mathrm{pre}}
+  \left(\prod_{k=i+1}^{j-1}(I+E_k)\right)
+  h_i^{\mathrm{post},T}.
+\end{equation}
+
+当 $E_k$ 较小时，
+\begin{equation}
+  \prod_{k=i+1}^{j-1}(I+E_k)
+  =
+  I+
+  \sum_{k=i+1}^{j-1}E_k
+  +O(E^2),
+\end{equation}
+于是
+\begin{equation}
+  c_{ij}
+  \approx
+  h_j^{\mathrm{pre}}h_i^{\mathrm{post},T}
+  +
+  \sum_{k=i+1}^{j-1}
+  h_j^{\mathrm{pre}}E_kh_i^{\mathrm{post},T}.
+\end{equation}
+
+第一项是 identity 已有的动态路由表达；第二项是额外的静态 residual 通信。因此 identity-offdiag 比 identity 更强，但仍以 $I$ 为中心。
+
+\subsection*{Identity-tanh-offdiag 的表达能力}
+
+对 tanh 版本，令
+\begin{equation}
+  O=
+  \one\one^T-I.
+\end{equation}
+则
+\begin{equation}
+  E_l=
+  \gamma_l O\odot\tanh(A_l),
+  \qquad
+  |(E_l)_{ij}|
+  \le
+  \gamma_l,
+  \qquad
+  (E_l)_{ii}=0.
+\end{equation}
+
+因此它的层间通道不是单个 rank-$n$ kernel，而是
+\begin{equation}
+  c_{t+1,s}^{\mathrm{off}}
+  =
+  h_{t+1}^{\mathrm{pre}}
+  \left(
+  \prod_{r=s+1}^{t}(I+E_r)
+  \right)
+  h_s^{\mathrm{post},T}.
+\end{equation}
+
+非交换乘积可展开为
+\begin{equation}
+  \prod_{r=s+1}^{t}(I+E_r)
+  =
+  I+
+  \sum_{m=1}^{t-s}
+  \sum_{s<r_1<\cdots<r_m\le t}
+  E_{r_m}\cdots E_{r_1}.
+\end{equation}
+
+所以
+\begin{equation}
+  c_{t+1,s}^{\mathrm{off}}
+  =
+  \underbrace{
+  h_{t+1}^{\mathrm{pre}}h_s^{\mathrm{post},T}
+  }_{\text{identity direct route}}
+  +
+  \sum_{m\ge1}
+  \sum_{s<r_1<\cdots<r_m\le t}
+  \underbrace{
+  h_{t+1}^{\mathrm{pre}}E_{r_m}\cdots E_{r_1}h_s^{\mathrm{post},T}
+  }_{\text{$m$-hop stream path}}.
+\end{equation}
+
+每个 $E_r$ 可看成 streams 上的有符号有向图：
+\begin{equation}
+  (E_r)_{ab}
+  =
+  \text{stream } b\to a \text{ 的边权}.
+\end{equation}
+于是 $E_{r_m}\cdots E_{r_1}$ 表示跨过多层的 $m$-hop graph walk。Pure identity 只有 direct route；identity-tanh-offdiag 额外拥有 bounded residual graph walks。
+
+从层间矩阵角度，一阶近似可写为
+\begin{equation}
+  C^{\mathrm{off}}
+  \approx
+  PQ^T+
+  \sum_r S_r\odot(PE_rQ^T),
+\end{equation}
+其中
+\begin{equation}
+  (S_r)_{t+1,s}
+  =
+  \mathbf{1}\{s<r\le t\}.
+\end{equation}
+每个修正核满足
+\begin{equation}
+  \mathrm{rank}(PE_rQ^T)
+  \le
+  n.
+\end{equation}
+
+因此 identity-tanh-offdiag 的表达空间可以理解为
+\begin{equation}
+  \text{rank-}n\text{ base kernel}
+  +
+  \text{interval-gated rank-}n\text{ path kernels}.
+\end{equation}
+
+高阶项对应
+\begin{equation}
+  S_{r_1,\dots,r_m}
+  \odot
+  (PE_{r_m}\cdots E_{r_1}Q^T),
+\end{equation}
+其中
+\begin{equation}
+  (S_{r_1,\dots,r_m})_{t+1,s}
+  =
+  \mathbf{1}\{s<r_1<\cdots<r_m\le t\}.
+\end{equation}
+这些项仍通过 $n$ 维 stream space 传播，但不同路径和不同区间 mask 叠加后，比 pure identity 的单个 $PQ^T$ 更丰富。
+
+同时 tanh 和 $\gamma_l$ 给出幅度控制。若
+\begin{equation}
+  \norm{E_l}_2\le\epsilon_l,
+\end{equation}
+则任意 $m$-hop 路径项满足
+\begin{equation}
+  \norm{E_{r_m}\cdots E_{r_1}}_2
+  \le
+  \prod_{a=1}^{m}\epsilon_{r_a}.
+\end{equation}
+当 $\epsilon_l$ 较小时，高阶路径按阶数衰减，主要贡献来自 direct route 和低阶 offdiag corrections。
+
+可以用以下量衡量它相对 identity 增加了多少表达力：
+\begin{equation}
+  \norm{C^{\mathrm{off}}-PQ^T}_F,
+  \qquad
+  r_{\mathrm{eff}}(C^{\mathrm{off}}),
+  \qquad
+  \norm{\prod_r(I+E_r)-I}_2.
+\end{equation}
+前两个量衡量 kernel 复杂度增加；最后一个量衡量 residual path 偏离 identity 的稳定性代价。
+
+\subsection*{多层连乘稳定性}
+
+令
+\begin{equation}
+  \Pi_L=
+  \prod_{l=0}^{L-1}(I+E_l),
+  \qquad
+  \epsilon_l=\norm{E_l}_2.
+\end{equation}
+
+则
+\begin{equation}
+  \norm{\Pi_L}_2
+  \le
+  \prod_{l=0}^{L-1}(1+\epsilon_l)
+  \le
+  \exp\left(\sum_{l=0}^{L-1}\epsilon_l\right).
+\end{equation}
+
+若 $\epsilon_l<1$，则
+\begin{equation}
+  \sigma_{\min}(I+E_l)
+  \ge
+  1-\epsilon_l,
+\end{equation}
+从而
+\begin{equation}
+  \sigma_{\min}(\Pi_L)
+  \ge
+  \prod_{l=0}^{L-1}(1-\epsilon_l),
+  \qquad
+  \kappa(\Pi_L)
+  \le
+  \prod_{l=0}^{L-1}\frac{1+\epsilon_l}{1-\epsilon_l}.
+\end{equation}
+
+因此只要
+\begin{equation}
+  \sum_l \norm{E_l}_2
+  \quad\text{较小},
+\end{equation}
+多层连乘仍接近可逆、接近 identity，不会像严格正双随机矩阵那样由 stochastic mixing 推向 rank-one 的 $\J$。
+
+若 $|(E_l)_{ij}|\le\gamma_l$ 且 $(E_l)_{ii}=0$，则有粗略界
+\begin{equation}
+  \norm{E_l}_2
+  \le
+  \norm{E_l}_F
+  \le
+  \gamma_l\sqrt{n(n-1)}.
+\end{equation}
+对 $n=4$，即
+\begin{equation}
+  \norm{E_l}_2
+  \le
+  \sqrt{12}\gamma_l.
+\end{equation}
+
+所以 identity-offdiag 的稳定性是有条件的：它依赖 offdiag scale 和谱范数足够小。优势在于乘积围绕 $I$ 扰动，而不是围绕均匀平均 $\J$ 收缩。
+
+\section{Permutation drift}
+
+若 $H_l=P_l$ 是 permutation matrix，则
+\begin{equation}
+  \norm{P_l x}_2=\norm{x}_2,
+  \qquad
+  P_{L-1}\cdots P_0 \text{ 仍是 permutation}.
+\end{equation}
+
+它不会塌缩到 $\J$。但如果 $P_l$ 随层变化，stream label 会漂移：
+\begin{equation}
+  \text{stream }s\text{ at layer }0
+  \not\equiv
+  \text{stream }s\text{ at layer }L.
+\end{equation}
+
+这会增加 $\Hpre,\Hpost$ 的学习负担。Identity 是最简单的 permutation：
+\begin{equation}
+  I\cdots I=I.
+\end{equation}
+它保持 stream 坐标系固定。
+
+\section{Sinkhorn 的问题}
+
+Sinkhorn 对 logits $A$ 做
+\begin{equation}
+  M^{(0)}=\exp(A),
+\end{equation}
+并交替归一化行和列。只要 logits 有限，
+\begin{equation}
+  M^{(t)}_{ij}>0.
+\end{equation}
+
+因此 Sinkhorn 输出通常是严格正双随机矩阵。严格正带来稳定 mixing，也带来差异方向收缩：
+\begin{equation}
+  H_{L-1}\cdots H_0
+  \approx
+  \J.
+\end{equation}
+
+所以问题不是单层 Sinkhorn 不满足约束，而是多层连乘可能过度平均。
+
+\section{结论}
+
+\begin{center}
+\small
+\begin{tabular}{p{0.17\linewidth}p{0.23\linewidth}p{0.18\linewidth}p{0.30\linewidth}}
+\toprule
+性质 & learned 双随机 $\Hres$ & identity $\Hres$ & identity-offdiag $\Hres=I+E$ \\
+\midrule
+谱范数 & $1$ & $1$ & $\le 1+\norm{E}_2$ \\
+均值方向 & 保留 & 保留 & 小幅扰动；若 $E\one=0$ 则保留 \\
+差异方向 & 可能收缩 & 保留 & 近似保留，并允许小幅混合 \\
+深层乘积 & 可能趋向 $\J$ & 始终为 $I$ & $\prod_l(I+E_l)$ \\
+stream identity & 可能漂移 & 固定 & 基本固定，允许小通信 \\
+跨 stream 表达 & $\Hres,\Hpre,\Hpost$ & $\Hpre,\Hpost,f_l$ & $E,\Hpre,\Hpost,f_l$ \\
+表达能力量化 & 可能因 $\prod H\to\J$ 退化 & rank-$n$ kernel $PQ^T$ & rank-$n$ kernel 加 bounded path kernels \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+简洁地说：
+\begin{equation}
+  \text{learned 双随机 }\Hres:
+  \quad
+  \text{稳定，但可能 homogenize streams；}
+\end{equation}
+\begin{equation}
+  \text{identity }\Hres:
+  \quad
+  \text{稳定，且保留 rank-}n\text{ 的 stream kernel。}
+\end{equation}
+\begin{equation}
+  \text{identity-offdiag }\Hres:
+  \quad
+  \text{单位主干 } I \text{ 加 bounded graph-walk corrections。}
+\end{equation}
+
+这给出实验现象的理论解释：$\Hres=I$ 可能更好，不是因为它更复杂，而是因为它把 residual path 变成无损传输，把跨层 attention kernel 简化为 $H^{\mathrm{pre}}H^{\mathrm{post}}$，并把跨 stream 表达交给动态 $\Hpre,\Hpost$ 和非线性 branch。Identity-offdiag 则是在这个无损主干上增加小的静态通信；它避免了 Sinkhorn 正双随机矩阵的系统性 Dobrushin 收缩。若 $\sum_l\norm{E_l}_2$ 受控，它比 learned 双随机矩阵更不容易在深层连乘中被平均化，同时比 pure identity 更有 residual path 表达力。
+
+\section*{参考}
+
+\begin{enumerate}[leftmargin=2em]
+  \item 苏剑林，\href{https://spaces.ac.cn/archives/11664}{《Attention Residuals 回忆录：兼谈 Linear Attention 的 Scale Law》}，科学空间。
+  \item 涮月亮的谪仙人，\href{https://zhuanlan.zhihu.com/p/2010852389670908320}{《你的 DeepSeek mHC 可能不需要 ``m''》}，知乎。
+  \item Tyler Romero, \href{https://www.tylerromero.com/translations/zhihu/your-deepseek-mhc-might-not-need-the-m/}{Your DeepSeek mHC Might Not Need the ``m''}.
+  \item \href{https://arxiv.org/abs/2601.05732}{mHC-lite: You Don't Need 20 Sinkhorn-Knopp Iterations}.
+\end{enumerate}
+
+\end{document}

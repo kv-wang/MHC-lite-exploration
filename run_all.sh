@@ -16,7 +16,7 @@ N_EXP="${N_EXP:-8}"
 TOP_K="${TOP_K:-2}"
 STRIDE="${STRIDE:-2}"
 
-export WANDB_API_KEY="${WANDB_API_KEY:-2eaf5d3e15da1d68fbce32137184e1eaba001ff6}"
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.bandw.top}"
 
 run_one() {

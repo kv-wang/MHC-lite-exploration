@@ -57,6 +57,13 @@ def make_equal_diag_offdiag_doubly_stochastic(size, diag_mass_frac=1.):
     return matrix
 
 
+def make_random_h_res_logits(size, scale=1., init_index=0):
+    generator = torch.Generator()
+    seed = (torch.initial_seed() + 1_000_003 * (int(init_index) + 1)) % (2**63 - 1)
+    generator.manual_seed(seed)
+    return torch.randn((size, size), generator=generator) * float(scale)
+
+
 DYNAMIC_H_RES_DISABLED_MODES = {
     "unconstrained",
     "identity_tanh_offdiag",
@@ -480,6 +487,8 @@ def get_init_and_expand_reduce_stream_functions(
     disable = default(disable, num_streams == 1 and num_fracs == 1)
 
     hyper_conn_klass = ManifoldConstrainedHyperConnections if not disable else Residual
+    if hyper_conn_klass is ManifoldConstrainedHyperConnections and kwargs.get("mhc_h_res_random_init_logits", False):
+        ManifoldConstrainedHyperConnections._h_res_random_init_counter = 0
 
     init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, num_fracs = num_fracs, sinkhorn_iters = sinkhorn_iters, **kwargs)
     expand_active_streams = None
@@ -585,6 +594,8 @@ class Residual(Module):
 # hyper connection residual streams
 
 class ManifoldConstrainedHyperConnections(Module):
+    _h_res_random_init_counter = 0
+
     def __init__(
         self,
         num_residual_streams,
@@ -603,6 +614,8 @@ class ManifoldConstrainedHyperConnections(Module):
         mhc_gate_fn = "sigmoid",
         mhc_zero_init_pre_post_logits = False,
         mhc_identity_h_res = False,
+        mhc_train_only_pre_post = False,
+        mhc_freeze_h_res = False,
         mhc_h_res_mode = "sinkhorn",
         mhc_admm_iters = 20,
         mhc_admm_rho = 1.,
@@ -612,6 +625,8 @@ class ManifoldConstrainedHyperConnections(Module):
         mhc_admm_step_scale = 1.,
         mhc_h_res_init_diag_mass_frac = 1.,
         mhc_h_res_cap = 1.5,
+        mhc_h_res_random_init_logits = False,
+        mhc_h_res_random_init_logit_scale = 1.,
         mhc_h_res_offdiag_init_scale = 0.05,
         mhc_h_res_offdiag_trainable = True,
         mhc_disable_dynamic_h_res = False,
@@ -648,6 +663,10 @@ class ManifoldConstrainedHyperConnections(Module):
             raise ValueError("mhc_h_res_init_diag_mass_frac must be in [0, 1]")
         if mhc_h_res_cap <= 0:
             raise ValueError("mhc_h_res_cap must be > 0")
+        if mhc_h_res_random_init_logit_scale < 0:
+            raise ValueError("mhc_h_res_random_init_logit_scale must be >= 0")
+        if mhc_h_res_random_init_logits and mhc_h_res_mode != "sinkhorn":
+            raise ValueError("mhc_h_res_random_init_logits=True is only supported when mhc_h_res_mode='sinkhorn'")
         if mhc_h_res_offdiag_init_scale <= 0:
             raise ValueError("mhc_h_res_offdiag_init_scale must be > 0")
         if mhc_disable_dynamic_h_res and mhc_h_res_mode not in DYNAMIC_H_RES_DISABLED_MODES:
@@ -663,6 +682,10 @@ class ManifoldConstrainedHyperConnections(Module):
             raise ValueError("mhc_adapter_cap must be > 0")
         if mhc_adapter_admm_input_floor <= 0:
             raise ValueError("mhc_adapter_admm_input_floor must be > 0")
+
+        mhc_train_only_pre_post = bool(mhc_train_only_pre_post)
+        mhc_freeze_h_res = bool(mhc_freeze_h_res)
+        mhc_identity_h_res = bool(mhc_identity_h_res or mhc_train_only_pre_post)
 
         self.branch = branch
 
@@ -715,13 +738,26 @@ class ManifoldConstrainedHyperConnections(Module):
                 num_residual_streams_fracs,
                 diag_mass_frac=mhc_h_res_init_diag_mass_frac,
             )
+        elif mhc_h_res_mode == "sinkhorn" and mhc_h_res_random_init_logits:
+            init_index = type(self)._h_res_random_init_counter
+            type(self)._h_res_random_init_counter += 1
+            init_alpha1 = make_random_h_res_logits(
+                num_residual_streams_fracs,
+                scale=mhc_h_res_random_init_logit_scale,
+                init_index=init_index,
+            )
         else:
             init_alpha1 = torch.ones((num_residual_streams_fracs, num_residual_streams_fracs)) * -8
             init_alpha1.fill_diagonal_(0.)
         self.static_alpha = nn.Parameter(cat((init_alpha0, init_alpha1), dim = 1))
+        self._fixed_h_res_initial = init_alpha1.detach().clone()
+        if mhc_freeze_h_res:
+            self.static_alpha.register_hook(self._zero_static_h_res_grad)
 
         self.dynamic_h_res_disabled = bool(
-            mhc_disable_dynamic_h_res and mhc_h_res_mode in DYNAMIC_H_RES_DISABLED_MODES
+            mhc_train_only_pre_post
+            or mhc_freeze_h_res
+            or (mhc_disable_dynamic_h_res and mhc_h_res_mode in DYNAMIC_H_RES_DISABLED_MODES)
         )
         dynamic_alpha_out_dim = num_fracs * num_residual_streams * num_input_views
         if not self.dynamic_h_res_disabled:
@@ -742,9 +778,13 @@ class ManifoldConstrainedHyperConnections(Module):
         if mhc_h_res_mode in {"identity_tanh_offdiag", "identity_clip_offdiag"}:
             offdiag_log_scale = torch.tensor(math.log(float(mhc_h_res_offdiag_init_scale)))
             if mhc_h_res_offdiag_trainable:
-                self.h_res_offdiag_log_scale = nn.Parameter(offdiag_log_scale)
+                self.h_res_offdiag_log_scale = nn.Parameter(
+                    offdiag_log_scale,
+                    requires_grad=not mhc_freeze_h_res,
+                )
             else:
                 self.register_buffer("h_res_offdiag_log_scale", offdiag_log_scale)
+            self._fixed_h_res_offdiag_log_scale_initial = self.h_res_offdiag_log_scale.detach().clone()
 
         # depth connection related (beta)
 
@@ -776,6 +816,8 @@ class ManifoldConstrainedHyperConnections(Module):
         self.mhc_gate_fn = mhc_gate_fn
         self.mhc_zero_init_pre_post_logits = mhc_zero_init_pre_post_logits
         self.mhc_identity_h_res = mhc_identity_h_res
+        self.mhc_train_only_pre_post = mhc_train_only_pre_post
+        self.mhc_freeze_h_res = mhc_freeze_h_res
         self.mhc_h_res_mode = mhc_h_res_mode
         self.mhc_admm_iters = mhc_admm_iters
         self.mhc_admm_rho = mhc_admm_rho
@@ -785,6 +827,8 @@ class ManifoldConstrainedHyperConnections(Module):
         self.mhc_admm_step_scale = mhc_admm_step_scale
         self.mhc_h_res_init_diag_mass_frac = mhc_h_res_init_diag_mass_frac
         self.mhc_h_res_cap = mhc_h_res_cap
+        self.mhc_h_res_random_init_logits = mhc_h_res_random_init_logits
+        self.mhc_h_res_random_init_logit_scale = mhc_h_res_random_init_logit_scale
         self.mhc_h_res_offdiag_init_scale = mhc_h_res_offdiag_init_scale
         self.mhc_h_res_offdiag_trainable = mhc_h_res_offdiag_trainable
         self.mhc_disable_dynamic_h_res = mhc_disable_dynamic_h_res
@@ -906,6 +950,20 @@ class ManifoldConstrainedHyperConnections(Module):
     def static_h_res(self):
         return self.static_alpha[:, self.num_input_views:]
 
+    def _zero_static_h_res_grad(self, grad):
+        grad = grad.clone()
+        grad[:, self.num_input_views:] = 0.
+        return grad
+
+    @torch.no_grad()
+    def capture_fixed_h_res_parameters(self):
+        if not self.mhc_freeze_h_res:
+            return
+        self._fixed_h_res_initial = self.static_h_res().detach().clone()
+        log_scale = getattr(self, "h_res_offdiag_log_scale", None)
+        if log_scale is not None:
+            self._fixed_h_res_offdiag_log_scale_initial = log_scale.detach().clone()
+
     def identity_offdiag_base(self, h_res_logits):
         n = h_res_logits.shape[-1]
         eye = torch.eye(n, device=h_res_logits.device, dtype=h_res_logits.dtype)
@@ -932,11 +990,35 @@ class ManifoldConstrainedHyperConnections(Module):
 
     def effective_static_h_res(self):
         h_res = self.static_h_res()
+        if self.mhc_identity_h_res:
+            return torch.eye(
+                h_res.shape[-1],
+                device=h_res.device,
+                dtype=h_res.dtype,
+            )
         if self.mhc_h_res_mode == "identity_tanh_offdiag":
             return self.identity_tanh_offdiag_h_res(h_res)
         if self.mhc_h_res_mode == "identity_clip_offdiag":
             return self.identity_clip_offdiag_h_res(h_res)
         return h_res
+
+    @torch.no_grad()
+    def reset_fixed_h_res_parameters(self):
+        h_res = self.static_h_res()
+        if self.mhc_identity_h_res:
+            h_res.zero_()
+            h_res.fill_diagonal_(1.)
+        elif self.mhc_freeze_h_res:
+            fixed_h_res = self._fixed_h_res_initial.to(device=h_res.device, dtype=h_res.dtype)
+            h_res.copy_(fixed_h_res)
+            log_scale = getattr(self, "h_res_offdiag_log_scale", None)
+            fixed_log_scale = getattr(self, "_fixed_h_res_offdiag_log_scale_initial", None)
+            if log_scale is not None and fixed_log_scale is not None:
+                log_scale.copy_(fixed_log_scale.to(device=log_scale.device, dtype=log_scale.dtype))
+        else:
+            return
+        if self.residual_scale is not None:
+            self.residual_scale.zero_()
 
     def reset_h_res_alm_dual_update_accumulators(self):
         self._h_res_alm_update_count = 0

@@ -164,6 +164,8 @@ class GPTConfig:
     mhc_gate_fn: str = "sigmoid"
     mhc_zero_init_pre_post_logits: bool = False
     mhc_identity_h_res: bool = False
+    mhc_train_only_pre_post: bool = False
+    mhc_freeze_h_res: bool = False
     mhc_h_res_mode: str = "sinkhorn"
     mhc_admm_iters: int = 20
     mhc_admm_rho: float = 1.0
@@ -173,6 +175,8 @@ class GPTConfig:
     mhc_admm_step_scale: float = 1.0
     mhc_h_res_init_diag_mass_frac: float = 1.0
     mhc_h_res_cap: float = 1.5
+    mhc_h_res_random_init_logits: bool = False
+    mhc_h_res_random_init_logit_scale: float = 1.0
     mhc_h_res_offdiag_init_scale: float = 0.05
     mhc_h_res_offdiag_trainable: bool = True
     mhc_disable_dynamic_h_res: bool = False
@@ -196,14 +200,18 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        effective_identity_h_res = config.mhc_identity_h_res or config.mhc_train_only_pre_post
+
         hc_kwargs = dict(
             mhc_gate_fn=config.mhc_gate_fn,
-            mhc_identity_h_res=config.mhc_identity_h_res,
+            mhc_identity_h_res=effective_identity_h_res,
         )
         block_depth_memory = None
         if config.hyper_conn_type == "mhc":
             hc_kwargs.update(
                 mhc_zero_init_pre_post_logits=config.mhc_zero_init_pre_post_logits,
+                mhc_train_only_pre_post=config.mhc_train_only_pre_post,
+                mhc_freeze_h_res=config.mhc_freeze_h_res,
                 mhc_h_res_mode=config.mhc_h_res_mode,
                 mhc_admm_iters=config.mhc_admm_iters,
                 mhc_admm_rho=config.mhc_admm_rho,
@@ -213,6 +221,8 @@ class GPT(nn.Module):
                 mhc_admm_step_scale=config.mhc_admm_step_scale,
                 mhc_h_res_init_diag_mass_frac=config.mhc_h_res_init_diag_mass_frac,
                 mhc_h_res_cap=config.mhc_h_res_cap,
+                mhc_h_res_random_init_logits=config.mhc_h_res_random_init_logits,
+                mhc_h_res_random_init_logit_scale=config.mhc_h_res_random_init_logit_scale,
                 mhc_h_res_offdiag_init_scale=config.mhc_h_res_offdiag_init_scale,
                 mhc_h_res_offdiag_trainable=config.mhc_h_res_offdiag_trainable,
                 mhc_disable_dynamic_h_res=config.mhc_disable_dynamic_h_res,
