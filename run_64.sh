@@ -117,7 +117,7 @@ run_method() {
       method_desc="${model_name} mHC identity H_res"
       wandb_run_name="mhc-${model_name}-mhc-identity-${N_STREAMS}streams-reduce-${REDUCE_STREAM_MODE}-${MAX_ITERS}iter"
       out_prefix_method="mhc-identity-${N_STREAMS}streams-reduce-${REDUCE_STREAM_MODE}-${MAX_ITERS}iter"
-      extra_method_args+=(--mhc_identity_h_res=True)
+      extra_method_args+=(--mhc_train_only_pre_post=True)
       ;;
     *)
       echo "Unknown method: $method" >&2
@@ -168,10 +168,7 @@ run_method() {
 
 EXTRA_ARGS=("$@")
 
-run_method small identity_tanh_offdiag
-run_method small identity
 run_method large identity_tanh_offdiag
-run_method large identity
 
 echo ""
 echo "================================================================"
