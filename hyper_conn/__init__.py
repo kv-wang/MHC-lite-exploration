@@ -21,6 +21,11 @@ from .mhc_lite import (
     get_init_and_expand_reduce_stream_functions as mhclite_get_init_and_expand_reduce_stream_functions
 )
 
+from .kromhc import (
+    KromHC,
+    get_init_and_expand_reduce_stream_functions as kromhc_get_init_and_expand_reduce_stream_functions,
+)
+
 from .mhc_analysis import (
     MHCAnalysis,
     get_expand_reduce_stream_functions as mhc_analysis_get_expand_reduce_stream_functions,
@@ -63,6 +68,13 @@ def hyper_conn_init_func(hyper_conn_type: str, hyper_conn_n: int, **kwargs):
             hyper_conn_n,
             reduce_stream_mode = reduce_stream_mode,
             expand_stream_mode = expand_stream_mode,
+            **kwargs,
+        )
+    elif hyper_conn_type == "kromhc":
+        return kromhc_get_init_and_expand_reduce_stream_functions(
+            hyper_conn_n,
+            reduce_stream_mode=reduce_stream_mode,
+            expand_stream_mode=expand_stream_mode,
             **kwargs,
         )
     elif hyper_conn_type == "analysis":

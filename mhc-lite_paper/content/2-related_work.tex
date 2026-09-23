@@ -1,0 +1,46 @@
+\section{Background}
+\label{sec:background}
+
+\label{sec:background:transformer_residual}
+
+The residual connection paradigm, originally introduced by ResNet~\citep{he2016deep}, has been serving as the fundamental backbone of modern deep learning. It builds an identity mapping path that mitigates the vanishing gradient problem and enables the training of extremely deep networks~\citep{he2016identity}. This design was subsequently adopted by the Transformer architecture~\citep{vaswani2017attention} and has proven essential for the scalability of large language models (LLMs), such as GPT-3~\citep{brown2020language} and Llama~\citep{touvron2023llama}.
+
+Despite its widespread success, the standard residual connection has inherent limitations. The single-stream design restricts information flow to a single pathway, potentially limiting the representational capacity of very deep networks~\citep{huang2017densely}. Moreover, the fixed identity mapping, while stabilizing training, offers no adaptability to the varying computational demands across different layers or input contexts~\citep{srivastava2015highway}. These observations have motivated recent research into more flexible and expressive connection mechanisms that go beyond the simple identity shortcut while preserving training stability~\citep{xie2024residual,Zhu2024HyperConnections,mak2025residual,bhendawade2025mr,xie25mhc,liu2025th}.
+
+\paragraph{Hyper-Connections (HC).}
+Hyper-Connections (HC) generalizes residual connections by expanding a single residual stream into multiple streams and introducing dynamic connections among these streams~\cite{Zhu2024HyperConnections}. This generalized residual connection enriches the model’s connectivity and has been reported to accelerate convergence with little additional computation~\cite{Zhu2024HyperConnections}. 
+Let $\boldsymbol{x}_l\in \mathbb{R}^{n\times C}$ denote the input feature of the $l$-th layer, where $n$ is the number of residual streams and $C$ is the dimensionality. The architecture is formulated as follows.
+\begin{align}
+    \boldsymbol{x}_{l+1} = {\boldsymbol{H}}^{\text{res}}_l \boldsymbol{x}_l + {\boldsymbol{H}}^{\text{post}}_l f({\boldsymbol{H}}^{\text{pre}}_l\boldsymbol{x}_l;\mathcal{W}_l) \label{eq: hc}
+\end{align}
+where the residual matrix ${\boldsymbol{H}}^{\text{res}}_l\in \mathbb{R}^{n\times n}$ is dynamically determined by learnable parameters and $\boldsymbol{x}_l$, and is used to mix the residual streams. The terms ${\boldsymbol{H}}^{\text{pre}}_l, {\boldsymbol{H}}^{\text{post}}_l\in \mathbb{R}^{1\times n}$ are decided by learnable parameters and $\boldsymbol{x}_l$, and is used to aggregate the input and expand the output respectively. The term $f(\cdot ;\mathcal{W}_l)$ represents a learnable function parameterized by weights $\mathcal{W}_l$. 
+For the detailed computation of ${\boldsymbol{H}}^{\text{\text{res}}}_l$ and ${\boldsymbol{H}}^{\text{\text{pre}}}_l, {\boldsymbol{H}}^{\text{\text{post}}}_l$ in HC, we refer readers to the original paper~\cite{Zhu2024HyperConnections}. 
+
+\paragraph{Manifold-Constrained Hyper-Connections (\mHC).}
+Manifold-Constrained Hyper-Connections modifies the computation of ${\boldsymbol{H}}^{\text{\text{pre}}}_l,{\boldsymbol{H}}^{\text{\text{post}}}_l$ and ${\boldsymbol{H}}^{\text{\text{res}}}_l$, particularly, attempting to constrain ${\boldsymbol{H}}^{\text{\text{res}}}_l$ on the Birkhoff polytope $\mathcal{B}_n$, i.e., the set of doubly stochastic matrices, whose definition is as follows. 
+\label{eq:birkhoff_polytope}
+\begin{align}
+    \mathcal{B}_n=
+\left\{
+\boldsymbol{X} \in \mathbb{R}^{n\times n} \;\middle|\;
+\boldsymbol{X}^\top\mathbf{1}_n=\boldsymbol{X}\mathbf{1}_n = \mathbf{1}_n,\;
+\boldsymbol{X} \ge 0 \notag
+\right\}
+\end{align}
+where $\mathbf{1}_n$ denotes the all-ones vector and $\boldsymbol{X}\ge 0$ is entrywise.
+The doubly stochastic matrices exhibit identity-like stability because their spectral norms are bounded by 1 and the set is closed under matrix multiplication: repeated composition of doubly stochastic matrices is still doubly stochastic.
+Let $\boldsymbol{x}_l\in \mathbb{R}^{n\times C}$ denote the input feature in the $l$-th layer and $\boldsymbol{\hat x}_l\in \mathbb{R}^{1\times nC}$ denote the flatten input feature. The computation of \mHC is detailed as follows.
+\begin{align}
+    {\boldsymbol{\hat x}_l'} &= \mathop{ \mathrm{ RMSNorm } } (\boldsymbol{\hat x}_l) \notag 
+    \\ {\boldsymbol{H}}^{\text{\text{pre}}}_l &= \mathop{ \mathrm{ sigmoid } }
+    \left(
+    {\alpha^{\text{pre}}_l}
+    {\boldsymbol{\hat x}_l'}\boldsymbol{W}^{\text{\text{pre}}}_l + \boldsymbol{b}_l^{\text{pre}}\right) \notag
+    \\ {\boldsymbol{H}}^{\text{\text{post}}}_l &= 2\cdot \mathop{ \mathrm{ sigmoid } }\left({\alpha^{\text{post}}_l}{\boldsymbol{\hat x}_l'}\boldsymbol{W}^{\text{\text{post}}}_l + \boldsymbol{b}_l^{\text{post}}\right) \notag
+    \\ {\boldsymbol{H}}^{\text{\text{res}}}_l &=\mathop{ \mathrm{ SK } }\left(\exp\left(\mathop{ \mathrm{ mat } }\left({\alpha^{\text{res}}_l}{\boldsymbol{\hat x}_l'}\boldsymbol{W}^{\text{\text{res}}}_l + \boldsymbol{b}_l^{\text{res}}\right)\right)\right) \label{eq: skexp}
+\end{align}
+where $\boldsymbol{W}^{\text{\text{pre}}}_l,\boldsymbol{W}^{\text{\text{post}}}_l\in \mathbb{R}^{nC\times n}$ and $\boldsymbol{W}^{\text{\text{res}}}_l\in \mathbb{R}^{nC\times n^2}$ are learnable weight matrices in the $l$-th layer. The terms $\boldsymbol{b}^{\text{pre}}_l, \boldsymbol{b}^{\text{post}}_l\in \mathbb{R}^{1\times n}$ and $\boldsymbol{b}^{\text{res}}_l\in \mathbb{R}^{1\times n^2}$ are learnable biases. The terms ${\alpha^{\text{pre}}_l},{\alpha^{\text{post}}_l}$ and ${\alpha^{\text{res}}_l}$ are learnable scalars. 
+The function $\mathop{ \mathrm{ mat } }(\cdot)$ reshapes a matrix from $\mathbb{R}^{1\times n^2}$ to $\mathbb{R}^{n\times n}$.
+The $\mathop{ \mathrm{ RMSNorm } }(\cdot)$ refers to the RMSNorm~\cite{rmsnorm}.
+The $\exp(\cdot)$ function is entrywise. The $\mathop{ \mathrm{ SK } }(\cdot)$ iteration alternately rescales all columns and rows so that their sums equal 1. In the setup of \mHC, the SK iteration is repeated 20 times. 
+

@@ -93,7 +93,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # ----- hyper conn start -----
-hyper_conn_type = "none" # none, hc, mhc, mhc_lite, attn_res
+hyper_conn_type = "none" # none, hc, mhc, mhc_lite, kromhc, attn_res
 hyper_conn_n = 1 # num_streams
 hyper_conn_reduce_stream_mode = "sum" # "sum", "mean", "4mean", "softmax_4mean", or "score_router_4mean" for final multi-stream reduction
 hyper_conn_expand_stream_mode = "repeat" # "repeat", "split", or "repeat_base_zero_rest" for initial multi-stream expansion
@@ -116,6 +116,10 @@ mhc_h_res_random_init_logit_scale = 1.0 # stddev for sinkhorn H_res random logit
 mhc_h_res_offdiag_init_scale = 0.05 # identity_*_offdiag: gamma scale for off-diagonal H_res
 mhc_h_res_offdiag_trainable = True # identity_*_offdiag: train gamma if True; fixed gamma if False
 mhc_disable_dynamic_h_res = False # if True, supported static-H_res modes only generate dynamic H_pre parameters
+mhc_disable_dynamic_pre_post = False # if True, do not create dynamic H_pre/H_post parameters
+mhc_disable_dynamic_h_pre = False # if True, do not create dynamic H_pre parameters
+mhc_disable_dynamic_h_post = False # if True, do not create dynamic H_post parameters
+mhc_stream_chunk_size = 1024 # identity fast path chunk size along the residual-stream axis
 mhc_log_constraint_errors = False # log projected H_res row/column constraint errors during training
 mhc_constraint_log_interval = 100 # iteration interval for H_res constraint error logging
 mhc_log_h_res_diag_mass = False # log sum(diag(H_res)) / sum(H_res) during training
@@ -154,6 +158,7 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # legacy config; checkpoints are saved only once at the final iteration
 checkpoint_interval = 0 # > 0 saves every N local training iterations, overwriting ckpt.pt
+save_checkpoints = True # if False, skip both periodic and final checkpoint saves
 init_from = 'scratch' # 'scratch', 'resume', 'continue_ckpt', 'mhc_adapter', or 'gpt2*'
 continue_ckpt_path = "out-owt-medium-mhc-num-streams-4/ckpt.pt"
 continue_load_optimizer = True
@@ -203,7 +208,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -377,6 +382,11 @@ model_args = dict(
     mhc_h_res_offdiag_init_scale=mhc_h_res_offdiag_init_scale,
     mhc_h_res_offdiag_trainable=mhc_h_res_offdiag_trainable,
     mhc_disable_dynamic_h_res=mhc_disable_dynamic_h_res,
+    mhc_disable_dynamic_pre_post=mhc_disable_dynamic_pre_post,
+    mhc_disable_dynamic_h_pre=mhc_disable_dynamic_h_pre,
+    mhc_disable_dynamic_h_post=mhc_disable_dynamic_h_post,
+    mhc_stream_dtype=dtype,
+    mhc_stream_chunk_size=mhc_stream_chunk_size,
     mhc_adapter_base_streams=mhc_adapter_base_streams,
     mhc_adapter_epsilon=mhc_adapter_epsilon,
     mhc_adapter_cap=mhc_adapter_cap,
@@ -398,6 +408,26 @@ def strip_compile_prefix(state_dict):
             k = k[len(unwanted_prefix):]
         fixed[k] = v
     return fixed
+
+def adapt_identity_static_alpha_state_dict(model, state_dict):
+    target_state = model.state_dict()
+    adapted = dict(state_dict)
+    copied = 0
+    for k, old in state_dict.items():
+        if not k.endswith(".static_alpha") or k not in target_state:
+            continue
+        new = target_state[k]
+        if old.shape == new.shape:
+            continue
+        if old.ndim != 2 or new.ndim != 2 or old.shape[0] != new.shape[0]:
+            continue
+        if old.shape[1] <= new.shape[1]:
+            continue
+        adapted[k] = old[:, :new.shape[1]].clone()
+        copied += 1
+    if copied:
+        print(f"Adapted {copied} identity static_alpha tensors by dropping checkpoint H_res columns")
+    return adapted
 
 def adapt_mhc_4_to_n_state_dict(
     target_state,
@@ -569,16 +599,23 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'mhc_disable_dynamic_h_res']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'mhc_disable_dynamic_h_res', 'mhc_disable_dynamic_pre_post', 'mhc_disable_dynamic_h_pre', 'mhc_disable_dynamic_h_post']:
         if k not in checkpoint_model_args:
             continue
         model_args[k] = checkpoint_model_args[k]
     if 'mhc_disable_dynamic_h_res' not in checkpoint_model_args:
         model_args['mhc_disable_dynamic_h_res'] = False
+    if 'mhc_disable_dynamic_pre_post' not in checkpoint_model_args:
+        model_args['mhc_disable_dynamic_pre_post'] = False
+    if 'mhc_disable_dynamic_h_pre' not in checkpoint_model_args:
+        model_args['mhc_disable_dynamic_h_pre'] = False
+    if 'mhc_disable_dynamic_h_post' not in checkpoint_model_args:
+        model_args['mhc_disable_dynamic_h_post'] = False
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = strip_compile_prefix(checkpoint['model'])
+    state_dict = adapt_identity_static_alpha_state_dict(model, state_dict)
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
@@ -591,6 +628,12 @@ elif init_from == 'continue_ckpt':
             model_args[k] = checkpoint_model_args[k]
     if 'mhc_disable_dynamic_h_res' not in checkpoint_model_args:
         model_args['mhc_disable_dynamic_h_res'] = False
+    if 'mhc_disable_dynamic_pre_post' not in checkpoint_model_args:
+        model_args['mhc_disable_dynamic_pre_post'] = False
+    if 'mhc_disable_dynamic_h_pre' not in checkpoint_model_args:
+        model_args['mhc_disable_dynamic_h_pre'] = False
+    if 'mhc_disable_dynamic_h_post' not in checkpoint_model_args:
+        model_args['mhc_disable_dynamic_h_post'] = False
     if continue_override_mhc_h_res_mode:
         model_args['mhc_h_res_mode'] = mhc_h_res_mode
         print(f"Overriding checkpoint H_res mode with: {mhc_h_res_mode}")
@@ -598,6 +641,7 @@ elif init_from == 'continue_ckpt':
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = strip_compile_prefix(checkpoint['model'])
+    state_dict = adapt_identity_static_alpha_state_dict(model, state_dict)
     model.load_state_dict(state_dict)
 
     loaded_best_val_loss = checkpoint.get('best_val_loss', 1e9)
@@ -1209,17 +1253,25 @@ def _dynamic_alpha_grad_pre_res(hc):
     if grad is None:
         return None, None
 
+    if getattr(hc, "dynamic_alpha_layout", None) == "kromhc":
+        pre_width = getattr(hc, "dynamic_alpha_pre_width", 0)
+        res_width = getattr(hc, "dynamic_alpha_res_width", 0)
+        return grad[..., :pre_width], grad[..., pre_width:pre_width + res_width]
+
     streams = getattr(hc, "num_residual_streams", None)
     if not streams or grad.shape[-1] % streams != 0:
         return grad, None
 
     width_per_stream = grad.shape[-1] // streams
-    pre_width = min(
+    pre_width = 0 if getattr(hc, "mhc_disable_dynamic_h_pre", False) else min(
         getattr(hc, "num_input_views", 0) * getattr(hc, "num_fracs", 1),
         width_per_stream,
     )
     grad_by_stream = grad.reshape(*grad.shape[:-1], streams, width_per_stream)
-    return grad_by_stream[..., :pre_width], grad_by_stream[..., pre_width:]
+    return (
+        None if pre_width == 0 else grad_by_stream[..., :pre_width],
+        None if getattr(hc, "dynamic_h_res_disabled", False) else grad_by_stream[..., pre_width:],
+    )
 
 
 def _hc_h_matrix_grad_norms(hc):
@@ -1229,9 +1281,14 @@ def _hc_h_matrix_grad_norms(hc):
 
     static_alpha = getattr(hc, "static_alpha", None)
     if static_alpha is not None and static_alpha.grad is not None:
-        split = getattr(hc, "num_input_views", 0)
-        _append_grad_sq(h_pre_parts, static_alpha.grad[:, :split])
-        _append_grad_sq(h_res_parts, static_alpha.grad[:, split:])
+        if static_alpha.ndim == 1 and getattr(hc, "dynamic_alpha_layout", None) == "kromhc":
+            split = getattr(hc, "dynamic_alpha_pre_width", 0)
+            _append_grad_sq(h_pre_parts, static_alpha.grad[:split])
+            _append_grad_sq(h_res_parts, static_alpha.grad[split:])
+        else:
+            split = getattr(hc, "num_input_views", 0)
+            _append_grad_sq(h_pre_parts, static_alpha.grad[:, :split])
+            _append_grad_sq(h_res_parts, static_alpha.grad[:, split:])
 
     dynamic_alpha_pre_grad, dynamic_alpha_res_grad = _dynamic_alpha_grad_pre_res(hc)
     _append_grad_sq(h_pre_parts, dynamic_alpha_pre_grad)
@@ -1271,8 +1328,12 @@ def collect_static_h_res_grad_matrices():
         static_alpha = getattr(hc, "static_alpha", None)
         if static_alpha is None or static_alpha.grad is None:
             continue
-        split = getattr(hc, "num_input_views", 0)
-        grad = static_alpha.grad[:, split:].detach().float().cpu()
+        if static_alpha.ndim == 1 and getattr(hc, "dynamic_alpha_layout", None) == "kromhc":
+            split = getattr(hc, "dynamic_alpha_pre_width", 0)
+            grad = static_alpha.grad[split:].detach().float().cpu()
+        else:
+            split = getattr(hc, "num_input_views", 0)
+            grad = static_alpha.grad[:, split:].detach().float().cpu()
         layer_index = block_idx * 2 + (0 if component == "attn" else 1)
         rows.append({
             "layer_index": layer_index,
@@ -1733,6 +1794,7 @@ while True:
 
     if (
         not eval_only
+        and save_checkpoints
         and checkpoint_interval > 0
         and local_iter_num % checkpoint_interval == 0
     ):
@@ -1741,7 +1803,7 @@ while True:
     if iter_num > max_iters:
         break
 
-if not eval_only and iter_num > 0:
+if not eval_only and save_checkpoints and iter_num > 0:
     final_iter_num = iter_num - 1
     final_was_periodic = (
         checkpoint_interval > 0

@@ -1,0 +1,48 @@
+
+
+\section{Hyperparameters}\label{sec:exp-details}
+Our implementation is based on nanoGPT \citep{karpathy2022nanogpt}, with all parameters set to default values unless otherwise specified. All models are trained from scratch using the AdamW optimizer \citep{loshchilov2017decoupled} with a cosine learning rate schedule and linear warmup. We use mixed-precision training with \texttt{bfloat16} and gradient clipping. All experiments are conducted on 8 NVIDIA A100 80GB GPUs using PyTorch's DistributedDataParallel (DDP) with the NCCL backend.
+
+
+The shared hyperparameters used across all experiments are summarized in \Cref{tab:shared-hyper-param}. 
+
+
+\begin{table}[h]
+    \centering
+    \begin{tabular}{l|c}
+    \toprule
+       Name  & Value \\ \midrule
+       batch size (per GPU)  & 16 \\ 
+       block size (sequence length) & 1024 \\
+       \# of iterations & 10000 \\
+       \# of learning rate decay iterations & 10000 \\
+       \# of warmup iterations & 200 \\
+       weight decay & 0.1 \\ 
+       $\beta_1$ & 0.9 \\
+       $\beta_2$ & 0.95 \\
+       gradient clip & 1.0 \\ 
+       dropout & 0.0 \\ 
+       \bottomrule
+    \end{tabular}
+    \vspace{0.6em}
+    \caption{Shared hyperparameters.}
+    \label{tab:shared-hyper-param}
+\end{table}
+
+For the three model scales (\textsf{S}, \textsf{M}, and \textsf{L}), their scale-specific hyperparameters listed in \Cref{tab:specific-hyper-param}. 
+\begin{table}[h]
+    \centering{\setlength{\tabcolsep}{4pt}
+    \begin{tabular}{l|c|c|c}
+    \toprule
+       Name  & \textsf{S} & \textsf{M} & \textsf{L} \\ \midrule
+        \# of layers & 6 & 12 & 24 \\
+        \# of heads & 8 & 12 & 16 \\ 
+        hidden dimension & 512 & 768 & 1024 \\
+        learning rate & $10^{-3}$ & $6 \times 10^{-4}$ & $3\times 10^{-4}$ \\
+        minimum learning rate &  $10^{-4}$ & $6 \times 10^{-5}$ & $3 \times 10^{-5}$ \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{0.6em}
+    \caption{Scale-specific hyperparameters.}
+    \label{tab:specific-hyper-param}
+\end{table}

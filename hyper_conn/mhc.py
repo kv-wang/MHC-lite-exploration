@@ -43,6 +43,116 @@ def add(x, y):
     return x + y
 
 
+def _resolve_stream_dtype(dtype):
+    if dtype is None or isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        mapping = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }
+        if dtype not in mapping:
+            raise ValueError(f"Invalid stream dtype: {dtype}")
+        return mapping[dtype]
+    raise TypeError(f"stream_dtype must be a torch.dtype, string, or None; got {type(dtype)!r}")
+
+
+class IdentityStreamState:
+    """Factorized residual-stream state for identity H_res connections.
+
+    With H_res=I and no dynamic H_pre/H_post, every stream is the initial
+    residual plus a stream-specific linear combination of branch outputs.  We
+    keep that factorization instead of materializing B*S*T*D activations.
+    """
+
+    def __init__(self, base, num_streams):
+        self.base = base
+        self.num_streams = int(num_streams)
+        self.coeff_columns = []
+        self.outputs = []
+
+    def branch_input(self, weights):
+        weights = weights.reshape(self.num_streams).to(
+            device=self.base.device,
+            dtype=self.base.dtype,
+        )
+        branch_input = self.base * weights.sum()
+        for beta, output in zip(self.coeff_columns, self.outputs):
+            coeff = torch.sum(weights * beta.to(device=weights.device, dtype=weights.dtype))
+            branch_input = branch_input + output * coeff
+        return branch_input
+
+    def append_update(self, beta, output):
+        self.coeff_columns.append(beta.reshape(self.num_streams))
+        self.outputs.append(output)
+
+    def reduce(self, layer_norm, reduce_mode, chunk_size):
+        if reduce_mode not in {"sum", "mean", "4mean"}:
+            raise ValueError(
+                "compressed identity streams currently support only sum/mean/4mean "
+                f"reduction, got {reduce_mode!r}"
+            )
+
+        batch = self.base.shape[0]
+        stream_chunk = self.num_streams if chunk_size <= 0 else int(chunk_size)
+        coeff_matrix = (
+            torch.stack(self.coeff_columns, dim=1)
+            if self.coeff_columns
+            else self.base.new_empty((self.num_streams, 0))
+        )
+        outputs = tuple(self.outputs)
+
+        def materialize_and_norm(base, coeff_chunk, *branch_outputs):
+            count = coeff_chunk.shape[0]
+            current = base.unsqueeze(1).expand(-1, count, -1, -1)
+            for index, output in enumerate(branch_outputs):
+                current = current + coeff_chunk[:, index].view(1, count, 1, 1) * output.unsqueeze(1)
+            flat = current.reshape(batch * count, *base.shape[1:])
+            normed = layer_norm(flat)
+            return normed.reshape(batch, count, *base.shape[1:])
+
+        reduced = None
+        for start in range(0, self.num_streams, stream_chunk):
+            end = min(start + stream_chunk, self.num_streams)
+            coeff_chunk = coeff_matrix[start:end]
+            if torch.is_grad_enabled() and (
+                self.base.requires_grad or any(output.requires_grad for output in outputs)
+            ):
+                normed = activation_checkpoint(
+                    materialize_and_norm,
+                    self.base,
+                    coeff_chunk,
+                    *outputs,
+                    use_reentrant=False,
+                )
+            else:
+                normed = materialize_and_norm(self.base, coeff_chunk, *outputs)
+            chunk_sum = normed.sum(dim=1)
+            reduced = chunk_sum if reduced is None else reduced + chunk_sum
+
+        if reduce_mode == "sum":
+            return reduced
+        scale = 1.0 / self.num_streams
+        if reduce_mode == "4mean":
+            scale *= 4.0
+        return reduced * scale
+
+
+class IdentityStreamExpand(Module):
+    """Create a factorized identity-stream state without stream expansion."""
+
+    def __init__(self, num_streams, stream_dtype=None):
+        super().__init__()
+        self.num_streams = int(num_streams)
+        self.stream_dtype = _resolve_stream_dtype(stream_dtype)
+
+    def forward(self, residuals):
+        if self.stream_dtype is not None and residuals.dtype != self.stream_dtype:
+            residuals = residuals.to(dtype=self.stream_dtype)
+        return IdentityStreamState(residuals, self.num_streams)
+
+
 def make_equal_diag_offdiag_doubly_stochastic(size, diag_mass_frac=1.):
     if size < 1:
         raise ValueError("size must be >= 1")
@@ -432,6 +542,8 @@ def get_expand_reduce_stream_functions(
     reduce_stream_mode = "sum",
     expand_stream_mode = "repeat",
     expand_active_streams = None,
+    stream_dtype = None,
+    compressed_identity = False,
 ):
     if num_streams == 1 or disable:
         return (nn.Identity(), nn.Identity())
@@ -441,7 +553,11 @@ def get_expand_reduce_stream_functions(
     if expand_stream_mode not in {"repeat", "split", "repeat_base_zero_rest"}:
         raise ValueError(f"Invalid expand_stream_mode: {expand_stream_mode}")
 
-    if add_stream_embed:
+    if compressed_identity:
+        if add_stream_embed:
+            raise ValueError("compressed identity streams do not support stream embeddings")
+        expand_fn = IdentityStreamExpand(num_streams, stream_dtype=stream_dtype)
+    elif add_stream_embed:
         assert exists(dim), '`dim` must be passed into get_init_and_expand_reduce_stream_functions for returning an expansion function with stream embeddings added'
 
         expand_fn = StreamEmbed(
@@ -450,12 +566,14 @@ def get_expand_reduce_stream_functions(
             expand_to_streams = True,
             expand_stream_mode = expand_stream_mode,
             expand_active_streams = expand_active_streams,
+            stream_dtype = stream_dtype,
         )
     else:
         expand_fn = ExpandStreams(
             num_streams,
             mode = expand_stream_mode,
             active_streams = expand_active_streams,
+            stream_dtype = stream_dtype,
         )
 
     if reduce_stream_mode == "4mean":
@@ -482,6 +600,7 @@ def get_init_and_expand_reduce_stream_functions(
     sinkhorn_iters = 20,
     reduce_stream_mode = "sum",
     expand_stream_mode = "repeat",
+    stream_dtype = None,
     **kwargs
 ):
     disable = default(disable, num_streams == 1 and num_fracs == 1)
@@ -503,6 +622,8 @@ def get_init_and_expand_reduce_stream_functions(
         reduce_stream_mode = reduce_stream_mode,
         expand_stream_mode = expand_stream_mode,
         expand_active_streams = expand_active_streams,
+        stream_dtype = stream_dtype,
+        compressed_identity = bool(kwargs.get("mhc_identity_stream_compressed", False)),
     )
 
     if exists(dim):
@@ -513,13 +634,19 @@ def get_init_and_expand_reduce_stream_functions(
 # norms
 
 class RMSNorm(Module):
-    def __init__(self, dim):
+    def __init__(self, dim, affine = True):
         super().__init__()
         self.scale = dim ** 0.5
-        self.gamma = nn.Parameter(torch.zeros(dim))
+        if affine:
+            self.gamma = nn.Parameter(torch.zeros(dim))
+        else:
+            self.register_parameter("gamma", None)
 
     def forward(self, x):
-        return F.normalize(x, dim = -1) * self.scale * (self.gamma + 1)
+        normed = F.normalize(x, dim = -1) * self.scale
+        if self.gamma is None:
+            return normed
+        return normed * (self.gamma + 1)
 
 # main classes
 
@@ -630,6 +757,11 @@ class ManifoldConstrainedHyperConnections(Module):
         mhc_h_res_offdiag_init_scale = 0.05,
         mhc_h_res_offdiag_trainable = True,
         mhc_disable_dynamic_h_res = False,
+        mhc_disable_dynamic_pre_post = False,
+        mhc_disable_dynamic_h_pre = False,
+        mhc_disable_dynamic_h_post = False,
+        mhc_identity_stream_compressed = False,
+        mhc_stream_chunk_size = 1024,
         mhc_adapter_base_streams = 4,
         mhc_adapter_epsilon = 0.1,
         mhc_adapter_cap = 1.,
@@ -685,6 +817,12 @@ class ManifoldConstrainedHyperConnections(Module):
 
         mhc_train_only_pre_post = bool(mhc_train_only_pre_post)
         mhc_freeze_h_res = bool(mhc_freeze_h_res)
+        mhc_disable_dynamic_pre_post = bool(mhc_disable_dynamic_pre_post)
+        mhc_disable_dynamic_h_pre = bool(mhc_disable_dynamic_h_pre or mhc_disable_dynamic_pre_post)
+        mhc_disable_dynamic_h_post = bool(mhc_disable_dynamic_h_post or mhc_disable_dynamic_pre_post)
+        mhc_stream_chunk_size = int(mhc_stream_chunk_size)
+        if mhc_stream_chunk_size < 0:
+            raise ValueError("mhc_stream_chunk_size must be >= 0")
         mhc_identity_h_res = bool(mhc_identity_h_res or mhc_train_only_pre_post)
 
         self.branch = branch
@@ -724,34 +862,41 @@ class ManifoldConstrainedHyperConnections(Module):
 
         # width connection
 
-        self.norm = RMSNorm(dim * num_residual_streams_fracs)
+        self.norm = None if (mhc_disable_dynamic_h_pre and mhc_disable_dynamic_h_post) else RMSNorm(
+            dim * num_residual_streams_fracs,
+        )
 
         if mhc_zero_init_pre_post_logits:
             init_alpha0 = torch.zeros((num_residual_streams_fracs, num_input_views_fracs))
         else:
             init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
             init_alpha0[init_residual_index, :] = 1.
-        if mhc_h_res_mode in {"identity_tanh_offdiag", "identity_clip_offdiag"}:
-            init_alpha1 = torch.zeros((num_residual_streams_fracs, num_residual_streams_fracs))
-        elif mhc_h_res_mode in {"unconstrained", "alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox"}:
-            init_alpha1 = make_equal_diag_offdiag_doubly_stochastic(
-                num_residual_streams_fracs,
-                diag_mass_frac=mhc_h_res_init_diag_mass_frac,
-            )
-        elif mhc_h_res_mode == "sinkhorn" and mhc_h_res_random_init_logits:
-            init_index = type(self)._h_res_random_init_counter
-            type(self)._h_res_random_init_counter += 1
-            init_alpha1 = make_random_h_res_logits(
-                num_residual_streams_fracs,
-                scale=mhc_h_res_random_init_logit_scale,
-                init_index=init_index,
-            )
+        if mhc_identity_h_res:
+            init_alpha1 = None
+            self.static_alpha = nn.Parameter(init_alpha0)
+            self._fixed_h_res_initial = None
         else:
-            init_alpha1 = torch.ones((num_residual_streams_fracs, num_residual_streams_fracs)) * -8
-            init_alpha1.fill_diagonal_(0.)
-        self.static_alpha = nn.Parameter(cat((init_alpha0, init_alpha1), dim = 1))
-        self._fixed_h_res_initial = init_alpha1.detach().clone()
-        if mhc_freeze_h_res:
+            if mhc_h_res_mode in {"identity_tanh_offdiag", "identity_clip_offdiag"}:
+                init_alpha1 = torch.zeros((num_residual_streams_fracs, num_residual_streams_fracs))
+            elif mhc_h_res_mode in {"unconstrained", "alm_signed", "alm_nonnegative", "alm_nonnegative_cap", "alm_signed_sprox", "alm_spectral_sprox"}:
+                init_alpha1 = make_equal_diag_offdiag_doubly_stochastic(
+                    num_residual_streams_fracs,
+                    diag_mass_frac=mhc_h_res_init_diag_mass_frac,
+                )
+            elif mhc_h_res_mode == "sinkhorn" and mhc_h_res_random_init_logits:
+                init_index = type(self)._h_res_random_init_counter
+                type(self)._h_res_random_init_counter += 1
+                init_alpha1 = make_random_h_res_logits(
+                    num_residual_streams_fracs,
+                    scale=mhc_h_res_random_init_logit_scale,
+                    init_index=init_index,
+                )
+            else:
+                init_alpha1 = torch.ones((num_residual_streams_fracs, num_residual_streams_fracs)) * -8
+                init_alpha1.fill_diagonal_(0.)
+            self.static_alpha = nn.Parameter(cat((init_alpha0, init_alpha1), dim = 1))
+            self._fixed_h_res_initial = init_alpha1.detach().clone()
+        if mhc_freeze_h_res and not mhc_identity_h_res:
             self.static_alpha.register_hook(self._zero_static_h_res_grad)
 
         self.dynamic_h_res_disabled = bool(
@@ -759,18 +904,26 @@ class ManifoldConstrainedHyperConnections(Module):
             or mhc_freeze_h_res
             or (mhc_disable_dynamic_h_res and mhc_h_res_mode in DYNAMIC_H_RES_DISABLED_MODES)
         )
-        dynamic_alpha_out_dim = num_fracs * num_residual_streams * num_input_views
+        dynamic_alpha_out_dim = 0
+        if not mhc_disable_dynamic_h_pre:
+            dynamic_alpha_out_dim += num_fracs * num_residual_streams * num_input_views
         if not self.dynamic_h_res_disabled:
             dynamic_alpha_out_dim += num_fracs * num_residual_streams * num_residual_streams
 
-        self.dynamic_alpha_fn = nn.Parameter(
-            torch.zeros(
-                dim * num_residual_streams, 
-                dynamic_alpha_out_dim
-            ) 
-        )
+        if dynamic_alpha_out_dim > 0:
+            self.dynamic_alpha_fn = nn.Parameter(
+                torch.zeros(
+                    dim * num_residual_streams,
+                    dynamic_alpha_out_dim
+                )
+            )
+        else:
+            self.register_parameter("dynamic_alpha_fn", None)
 
-        self.pre_branch_scale = nn.Parameter(torch.ones(1) * 1e-2)
+        if mhc_disable_dynamic_h_pre:
+            self.register_parameter("pre_branch_scale", None)
+        else:
+            self.pre_branch_scale = nn.Parameter(torch.ones(1) * 1e-2)
         self.residual_scale = nn.Parameter(
             torch.ones(1) * 1e-2,
             requires_grad=not self.dynamic_h_res_disabled,
@@ -802,13 +955,16 @@ class ManifoldConstrainedHyperConnections(Module):
             # XXX
             # same here
             # ------
-            dynamic_beta_shape = (
-                dim * num_residual_streams,
-                num_fracs * num_residual_streams
-            ) # preserve backwards compat
-            self.dynamic_beta_fn = nn.Parameter(torch.zeros(dynamic_beta_shape))
-
-            self.h_post_scale = nn.Parameter(torch.ones(()) * 1e-2)
+            if mhc_disable_dynamic_h_post:
+                self.register_parameter("dynamic_beta_fn", None)
+                self.register_parameter("h_post_scale", None)
+            else:
+                dynamic_beta_shape = (
+                    dim * num_residual_streams,
+                    num_fracs * num_residual_streams
+                ) # preserve backwards compat
+                self.dynamic_beta_fn = nn.Parameter(torch.zeros(dynamic_beta_shape))
+                self.h_post_scale = nn.Parameter(torch.ones(()) * 1e-2)
 
         # sinkhorn related
 
@@ -832,6 +988,11 @@ class ManifoldConstrainedHyperConnections(Module):
         self.mhc_h_res_offdiag_init_scale = mhc_h_res_offdiag_init_scale
         self.mhc_h_res_offdiag_trainable = mhc_h_res_offdiag_trainable
         self.mhc_disable_dynamic_h_res = mhc_disable_dynamic_h_res
+        self.mhc_disable_dynamic_pre_post = mhc_disable_dynamic_pre_post
+        self.mhc_disable_dynamic_h_pre = mhc_disable_dynamic_h_pre
+        self.mhc_disable_dynamic_h_post = mhc_disable_dynamic_h_post
+        self.mhc_identity_stream_compressed = bool(mhc_identity_stream_compressed)
+        self.mhc_stream_chunk_size = mhc_stream_chunk_size
         self.mhc_adapter_base_streams = mhc_adapter_base_streams
         self.mhc_adapter_epsilon = mhc_adapter_epsilon
         self.mhc_adapter_cap = mhc_adapter_cap
@@ -841,14 +1002,23 @@ class ManifoldConstrainedHyperConnections(Module):
         self.collect_h_res_constraint_errors = False
         self.reset_h_res_constraint_errors()
 
-        h_res_shape = (num_residual_streams_fracs, num_residual_streams_fracs)
-        h_res_alm_row_dual = torch.zeros(num_residual_streams_fracs, 1)
-        h_res_alm_col_dual = torch.zeros(1, num_residual_streams_fracs)
-        h_res_alm_nonneg_dual = torch.zeros(h_res_shape)
-        h_res_sprox_z = make_equal_diag_offdiag_doubly_stochastic(
-            num_residual_streams_fracs,
-            diag_mass_frac=mhc_h_res_init_diag_mass_frac,
-        )
+        if mhc_identity_h_res:
+            # Identity H_res never enters the ALM/S-prox constraint path.
+            # Keep the state-dict keys for compatibility, but do not allocate
+            # O(S^2) buffers for every MHC module.
+            h_res_alm_row_dual = torch.empty(0)
+            h_res_alm_col_dual = torch.empty(0)
+            h_res_alm_nonneg_dual = torch.empty(0)
+            h_res_sprox_z = torch.empty(0)
+        else:
+            h_res_shape = (num_residual_streams_fracs, num_residual_streams_fracs)
+            h_res_alm_row_dual = torch.zeros(num_residual_streams_fracs, 1)
+            h_res_alm_col_dual = torch.zeros(1, num_residual_streams_fracs)
+            h_res_alm_nonneg_dual = torch.zeros(h_res_shape)
+            h_res_sprox_z = make_equal_diag_offdiag_doubly_stochastic(
+                num_residual_streams_fracs,
+                diag_mass_frac=mhc_h_res_init_diag_mass_frac,
+            )
         self.register_buffer("h_res_alm_row_dual", h_res_alm_row_dual)
         self.register_buffer("h_res_alm_col_dual", h_res_alm_col_dual)
         self.register_buffer("h_res_alm_nonneg_dual", h_res_alm_nonneg_dual)
@@ -948,6 +1118,13 @@ class ManifoldConstrainedHyperConnections(Module):
         return self._h_res_alm_loss
 
     def static_h_res(self):
+        if self.mhc_identity_h_res:
+            size = self.num_residual_streams * self.num_fracs
+            return torch.eye(
+                size,
+                device=self.static_alpha.device,
+                dtype=self.static_alpha.dtype,
+            )
         return self.static_alpha[:, self.num_input_views:]
 
     def _zero_static_h_res_grad(self, grad):
@@ -991,11 +1168,7 @@ class ManifoldConstrainedHyperConnections(Module):
     def effective_static_h_res(self):
         h_res = self.static_h_res()
         if self.mhc_identity_h_res:
-            return torch.eye(
-                h_res.shape[-1],
-                device=h_res.device,
-                dtype=h_res.dtype,
-            )
+            return h_res
         if self.mhc_h_res_mode == "identity_tanh_offdiag":
             return self.identity_tanh_offdiag_h_res(h_res)
         if self.mhc_h_res_mode == "identity_clip_offdiag":
@@ -1004,11 +1177,10 @@ class ManifoldConstrainedHyperConnections(Module):
 
     @torch.no_grad()
     def reset_fixed_h_res_parameters(self):
-        h_res = self.static_h_res()
         if self.mhc_identity_h_res:
-            h_res.zero_()
-            h_res.fill_diagonal_(1.)
+            pass
         elif self.mhc_freeze_h_res:
+            h_res = self.static_h_res()
             fixed_h_res = self._fixed_h_res_initial.to(device=h_res.device, dtype=h_res.dtype)
             h_res.copy_(fixed_h_res)
             log_scale = getattr(self, "h_res_offdiag_log_scale", None)
@@ -1243,6 +1415,34 @@ class ManifoldConstrainedHyperConnections(Module):
     ):
         streams = self.num_residual_streams
 
+        if (
+            self.mhc_identity_stream_compressed
+            and isinstance(residuals, IdentityStreamState)
+            and self.mhc_identity_h_res
+            and self.dynamic_alpha_fn is None
+            and self.dynamic_beta_fn is None
+            and self.num_fracs == 1
+            and self.num_input_views == 1
+            and not self.channel_first
+            and self.residual_transform.__class__ is nn.Identity
+            and self.dropout.p == 0.0
+        ):
+            static_pre = self.static_alpha.reshape(streams)
+            if self.mhc_gate_fn == "softmax":
+                weights = F.softmax(static_pre, dim=0)
+            else:
+                weights = static_pre.sigmoid()
+            branch_input = residuals.branch_input(weights)
+
+            beta = None
+            if self.add_branch_out_to_residual:
+                beta = self.static_beta.reshape(streams)
+                if self.mhc_gate_fn == "softmax":
+                    beta = F.softmax(beta, dim=0)
+                else:
+                    beta = beta.sigmoid() * 2
+            return branch_input, residuals, dict(beta=beta)
+
         maybe_transformed_residuals = self.residual_transform(residuals)
 
         # width connection
@@ -1252,39 +1452,185 @@ class ManifoldConstrainedHyperConnections(Module):
         if self.channel_first:
             residuals = rearrange(residuals, 'b d ... -> b ... d')
 
-        # split out fractions
+        # Split fractions once and keep the flattened layout around.  The
+        # flattened view can be returned directly for identity H_res, avoiding
+        # a second B*S*T*D materialization when streams are very large.
+        residuals_split = self.split_fracs(residuals)
+        residuals = rearrange(residuals_split, '(b s) ... d -> b ... s d', s = streams)
 
-        residuals = self.split_fracs(residuals)
+        # Static identity + no dynamic H_pre/H_post needs no normed tensor or
+        # dynamic-router buffers.  Compute H_pre in stream chunks and keep the
+        # residual path in its original flattened layout.
+        if (
+            self.mhc_identity_h_res
+            and self.dynamic_alpha_fn is None
+            and self.dynamic_beta_fn is None
+            and self.num_fracs == 1
+        ):
+            static_pre = rearrange(
+                self.static_alpha,
+                '(f1 s) (f2 v) -> f1 s f2 v',
+                f1=self.num_fracs,
+                f2=self.num_fracs,
+                s=streams,
+                v=self.num_input_views,
+            )
+            if self.mhc_gate_fn == "softmax":
+                alpha_pre = F.softmax(static_pre, dim=-3)
+            else:
+                alpha_pre = static_pre.sigmoid()
 
-        # split out streams
+            chunked_branch_input = (
+                self.num_input_views == 1
+                and self.mhc_stream_chunk_size > 0
+                and self.mhc_stream_chunk_size < streams
+                and not torch.compiler.is_compiling()
+            )
+            if chunked_branch_input:
+                weights = alpha_pre.reshape(streams).to(dtype=residuals.dtype)
+                branch_input = residuals.new_zeros(*residuals.shape[:-2], residuals.shape[-1])
+                chunk_size = self.mhc_stream_chunk_size
+                for start in range(0, streams, chunk_size):
+                    end = min(start + chunk_size, streams)
+                    branch_input = branch_input + einsum(
+                        weights[start:end],
+                        residuals[..., start:end, :],
+                        's, ... s d -> ... d',
+                    )
+            elif self.num_input_views == 1 and torch.compiler.is_compiling():
+                weights = alpha_pre.reshape(streams).to(dtype=residuals.dtype)
+                branch_input = (
+                    residuals
+                    * weights.reshape(*([1] * (residuals.ndim - 2)), streams, 1)
+                ).sum(dim=-2)
+            else:
+                branch_input = einsum(
+                    alpha_pre,
+                    residuals,
+                    '... f1 s f2 v, ... f1 s d -> ... f2 v d',
+                )
 
-        residuals = rearrange(residuals, '(b s) ... d -> b ... s d', s = streams)
+            if self.num_input_views == 1:
+                if not chunked_branch_input and not torch.compiler.is_compiling():
+                    branch_input = branch_input[..., 0, :]
+            else:
+                branch_input = rearrange(branch_input, 'b ... v d -> v b ... d')
+            if self.channel_first:
+                branch_input = rearrange(branch_input, 'b ... d -> b d ...')
+            branch_input = self.merge_fracs(branch_input)
+
+            beta = None
+            if self.add_branch_out_to_residual:
+                beta = rearrange(self.static_beta, '... (s f) -> ... s f', s=streams)
+                if self.mhc_gate_fn == "softmax":
+                    beta = F.softmax(beta, dim=-2)
+                else:
+                    beta = beta.sigmoid() * 2
+
+            residuals_out = self.merge_fracs(residuals_split)
+            if self.channel_first:
+                residuals_out = rearrange(residuals_out, 'b ... d -> b d ...')
+            return branch_input, residuals_out, dict(beta=beta)
 
         # norm
         normed = rearrange(residuals, 'b ... s d -> b ... (s d)', s = streams)
         # normed = F.normalize(normed, dim = -1)
-        normed = self.norm(normed)
+        if self.norm is not None:
+            normed = self.norm(normed)
         if self.mhc_h_res_mode in {"adapter_epsilon", "adapter_cap", "adapter_cap_admm"}:
             base_streams = min(self.mhc_adapter_base_streams, streams)
             if base_streams < streams:
                 normed = normed * ((base_streams / streams) ** 0.5)
 
-        pre_branch_scale = repeat(self.pre_branch_scale, '1 -> v', v = self.num_input_views * self.num_fracs)
+        if self.pre_branch_scale is not None:
+            pre_branch_scale = repeat(self.pre_branch_scale, '1 -> v', v = self.num_input_views * self.num_fracs)
         residual_scale   = repeat(self.residual_scale  , '1 -> s', s = self.num_fracs * streams)
 
-        # alpha for weighted sum of residuals going into branch. Some H_res
-        # modes use static H_res only, so their dynamic network emits H_pre
-        # logits only instead of generating then zeroing a dynamic H_res block.
-        wc_weight = normed @ self.dynamic_alpha_fn
-        if self.dynamic_h_res_disabled:
-            wc_weight = rearrange(wc_weight, '... (s v) -> ... s v', s = streams)
-            dynamic_pre = wc_weight * pre_branch_scale
-            dynamic_residual = dynamic_pre.new_zeros(*dynamic_pre.shape[:-1], self.num_fracs * streams)
-            dynamic_alpha = cat((dynamic_pre, dynamic_residual), dim=-1)
+        # alpha for weighted sum of residuals going into branch. Dynamic H_res
+        # and dynamic H_pre can be omitted independently to avoid dead params.
+        dynamic_alpha_prefix = (*normed.shape[:-1], streams)
+        if self.dynamic_alpha_fn is None:
+            dynamic_pre = normed.new_zeros(*dynamic_alpha_prefix, self.num_input_views * self.num_fracs)
+            dynamic_residual = normed.new_zeros(*dynamic_alpha_prefix, self.num_fracs * streams)
         else:
-            wc_weight = rearrange(wc_weight, '... (s t) -> ... s t', s = streams)
-            alpha_scale = cat((pre_branch_scale, residual_scale))
-            dynamic_alpha = wc_weight * alpha_scale
+            wc_weight = normed @ self.dynamic_alpha_fn
+            offset = 0
+            if self.mhc_disable_dynamic_h_pre:
+                dynamic_pre = normed.new_zeros(*dynamic_alpha_prefix, self.num_input_views * self.num_fracs)
+            else:
+                pre_width = streams * self.num_input_views * self.num_fracs
+                dynamic_pre = rearrange(wc_weight[..., offset:offset + pre_width], '... (s v) -> ... s v', s=streams)
+                dynamic_pre = dynamic_pre * pre_branch_scale
+                offset += pre_width
+            if self.dynamic_h_res_disabled:
+                dynamic_residual = normed.new_zeros(*dynamic_alpha_prefix, self.num_fracs * streams)
+            else:
+                residual_width = streams * self.num_fracs * streams
+                dynamic_residual = rearrange(wc_weight[..., offset:offset + residual_width], '... (s t) -> ... s t', s=streams)
+                dynamic_residual = dynamic_residual * residual_scale
+
+        # With an identity residual mixer, the residual path is a direct
+        # passthrough.  Avoid materializing an (streams x streams) identity
+        # tensor and the corresponding full einsum; this is essential for
+        # very large stream counts.
+        if self.mhc_identity_h_res:
+            static_pre = rearrange(
+                self.static_alpha,
+                '(f1 s) (f2 v) -> f1 s f2 v',
+                f1=self.num_fracs,
+                f2=self.num_fracs,
+                s=streams,
+                v=self.num_input_views,
+            )
+            dynamic_pre = rearrange(
+                dynamic_pre,
+                '... f s v -> ... f s 1 v',
+                f=self.num_fracs,
+                v=self.num_input_views,
+            )
+            alpha_pre = dynamic_pre + static_pre
+            if self.mhc_gate_fn == "softmax":
+                alpha_pre = F.softmax(alpha_pre, dim=-3)
+            else:
+                alpha_pre = alpha_pre.sigmoid()
+
+            beta = None
+            if self.add_branch_out_to_residual:
+                static_beta = rearrange(self.static_beta, '... (s f) -> ... s f', s=streams)
+                if self.dynamic_beta_fn is None:
+                    dynamic_beta = normed.new_zeros(*normed.shape[:-1], streams, self.num_fracs)
+                else:
+                    dc_weight = normed @ self.dynamic_beta_fn
+                    dc_weight = rearrange(dc_weight, '... (s f) -> ... s f', s=streams)
+                    dynamic_beta = dc_weight * self.h_post_scale
+                beta = dynamic_beta + static_beta
+                if self.mhc_gate_fn == "softmax":
+                    beta = F.softmax(beta, dim=-2)
+                else:
+                    beta = beta.sigmoid() * 2
+
+            # Only contract the pre-router. The residual streams remain
+            # unchanged by H_res=I.
+            branch_input = einsum(
+                alpha_pre,
+                residuals,
+                '... f1 s f2 v, ... f1 s d -> ... f2 v d',
+            )
+            if self.num_input_views == 1:
+                branch_input = branch_input[..., 0, :]
+            else:
+                branch_input = rearrange(branch_input, 'b ... v d -> v b ... d')
+            if self.channel_first:
+                branch_input = rearrange(branch_input, 'b ... d -> b d ...')
+            branch_input = self.merge_fracs(branch_input)
+
+            residuals = rearrange(residuals, 'b ... s d -> (b s) ... d')
+            if self.channel_first:
+                residuals = rearrange(residuals, 'b ... d -> b d ...')
+            residuals = self.merge_fracs(residuals)
+            return branch_input, residuals, dict(beta=beta)
+
+        dynamic_alpha = cat((dynamic_pre, dynamic_residual), dim=-1)
 
         if (self.mhc_h_res_mode in DYNAMIC_H_RES_DISABLED_MODES and not self.dynamic_h_res_disabled) or self.mhc_identity_h_res:
             # When identity_h_res is set, zero the dynamic H_res columns so the
@@ -1295,6 +1641,12 @@ class ManifoldConstrainedHyperConnections(Module):
             dynamic_alpha[..., self.num_input_views:] = 0.
 
         static_alpha = rearrange(self.static_alpha, '(f s) t -> f s t', s = streams)
+        if self.mhc_identity_h_res:
+            static_alpha_residual = static_alpha.new_zeros(
+                *static_alpha.shape[:-1],
+                self.num_fracs * streams,
+            )
+            static_alpha = cat((static_alpha, static_alpha_residual), dim=-1)
 
         alpha = dynamic_alpha + static_alpha
 
@@ -1537,12 +1889,13 @@ class ManifoldConstrainedHyperConnections(Module):
 
         beta = None
         if self.add_branch_out_to_residual:
-            dc_weight = normed @ self.dynamic_beta_fn # ... (s f)
-            dc_weight = rearrange(dc_weight, '... (s f) -> ... s f', s = streams)
-
-            dynamic_beta = dc_weight * self.h_post_scale
-
             static_beta = rearrange(self.static_beta, '... (s f) -> ... s f', s = streams)
+            if self.dynamic_beta_fn is None:
+                dynamic_beta = normed.new_zeros(*normed.shape[:-1], streams, self.num_fracs)
+            else:
+                dc_weight = normed @ self.dynamic_beta_fn # ... (s f)
+                dc_weight = rearrange(dc_weight, '... (s f) -> ... s f', s = streams)
+                dynamic_beta = dc_weight * self.h_post_scale
 
             beta = dynamic_beta + static_beta
             if self.mhc_gate_fn == "softmax":
@@ -1578,6 +1931,54 @@ class ManifoldConstrainedHyperConnections(Module):
     ):
         assert self.add_branch_out_to_residual
 
+        if (
+            self.mhc_identity_stream_compressed
+            and isinstance(residuals, IdentityStreamState)
+            and self.mhc_identity_h_res
+            and self.dynamic_alpha_fn is None
+            and self.dynamic_beta_fn is None
+            and self.num_fracs == 1
+            and not self.channel_first
+            and self.dropout.p == 0.0
+        ):
+            beta = beta.to(device=residuals.base.device, dtype=residuals.base.dtype)
+            branch_output = self.split_fracs(branch_output)[..., 0, :]
+            residuals.append_update(beta, branch_output)
+            return residuals
+
+        # For static identity H_res with no dynamic H_post, update a single
+        # gradient-safe residual output in stream chunks.  This preserves the
+        # exact residual + beta * branch_output formula without first
+        # materializing a separate full B*S*T*D branch-output tensor.
+        if (
+            self.mhc_identity_h_res
+            and self.dynamic_alpha_fn is None
+            and self.dynamic_beta_fn is None
+            and self.num_fracs == 1
+            and not self.channel_first
+            and not torch.compiler.is_compiling()
+        ):
+            streams = self.num_residual_streams
+            # Clone before creating the stream view so the in-place chunked
+            # update targets the returned tensor rather than mutating the
+            # input view while leaving the clone unchanged.
+            residuals_split = self.split_fracs(residuals).clone()
+            residuals_by_stream = rearrange(
+                residuals_split,
+                '(b s) ... f d -> b ... s f d',
+                s=streams,
+            )
+            branch_output = self.split_fracs(branch_output)[..., 0, :]
+            beta = beta.to(device=residuals_by_stream.device, dtype=residuals_by_stream.dtype)
+            chunk_size = streams if self.mhc_stream_chunk_size <= 0 else self.mhc_stream_chunk_size
+            for start in range(0, streams, chunk_size):
+                end = min(start + chunk_size, streams)
+                residuals_by_stream[..., start:end, 0, :].addcmul_(
+                    beta[..., start:end, 0].unsqueeze(-1),
+                    branch_output.unsqueeze(-2),
+                )
+            return self.dropout(self.merge_fracs(residuals_split))
+
         # maybe split fractions
 
         branch_output = self.split_fracs(branch_output)
@@ -1586,6 +1987,9 @@ class ManifoldConstrainedHyperConnections(Module):
 
         if self.channel_first:
             branch_output = rearrange(branch_output, 'b d ... -> b ... d')
+
+        if beta is not None and beta.ndim == 2:
+            beta = beta.reshape(*([1] * (branch_output.ndim - 2)), 1, self.num_residual_streams, 1)
 
         output = einsum(branch_output, beta, 'b ... f1 d, b ... f1 s f2 -> b ... f2 s d')
 
@@ -1659,13 +2063,17 @@ class ExpandStreams(Module):
         num_streams,
         mode = "repeat",
         active_streams = None,
+        stream_dtype = None,
     ):
         super().__init__()
         self.num_streams = num_streams
         self.mode = mode
         self.active_streams = num_streams if active_streams is None else min(active_streams, num_streams)
+        self.stream_dtype = _resolve_stream_dtype(stream_dtype)
 
     def forward(self, residuals):
+        if self.stream_dtype is not None and residuals.dtype != self.stream_dtype:
+            residuals = residuals.to(dtype=self.stream_dtype)
         residuals = repeat(residuals, 'b ... -> b s ...', s = self.num_streams)
 
         if self.mode == "split":
@@ -1675,6 +2083,8 @@ class ExpandStreams(Module):
             residuals = residuals * mask.view(1, self.num_streams, *([1] * (residuals.ndim - 2)))
 
         residuals = rearrange(residuals, 'b s ... -> (b s) ...')
+        if not residuals.is_contiguous():
+            residuals = residuals.contiguous()
         return residuals
 
 class StreamEmbed(Module):
@@ -1686,6 +2096,7 @@ class StreamEmbed(Module):
         expand_to_streams = False,
         expand_stream_mode = "repeat",
         expand_active_streams = None,
+        stream_dtype = None,
     ):
         super().__init__()
         self.channel_first = channel_first
@@ -1694,9 +2105,13 @@ class StreamEmbed(Module):
         self.expand_to_streams = expand_to_streams
         self.expand_stream_mode = expand_stream_mode
         self.expand_active_streams = num_streams if expand_active_streams is None else min(expand_active_streams, num_streams)
+        self.stream_dtype = _resolve_stream_dtype(stream_dtype)
         self.stream_embed = nn.Parameter(torch.zeros(num_streams, dim))
 
     def forward(self, residuals):
+
+        if self.stream_dtype is not None and residuals.dtype != self.stream_dtype:
+            residuals = residuals.to(dtype=self.stream_dtype)
 
         if self.expand_to_streams:
             residuals = repeat(residuals, 'b ... -> b s ...', s = self.num_streams)

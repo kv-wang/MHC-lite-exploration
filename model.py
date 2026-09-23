@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from hyper_conn import hyper_conn_init_func
+from hyper_conn.mhc import IdentityStreamState
 from hyper_conn.attention_residuals import (
     AttentionResidualMixer,
     BlockAttentionResidualMixer,
@@ -22,14 +23,30 @@ from hyper_conn.attention_residuals import (
 )
 
 class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+    """LayerNorm with optional bias and an optional output-dtype guard."""
 
-    def __init__(self, ndim, bias):
+    def __init__(self, ndim, bias, preserve_input_dtype=False):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.preserve_input_dtype = preserve_input_dtype
 
     def forward(self, input):
+        # CUDA autocast promotes layer_norm to float32 when the affine
+        # parameters are float32.  That is numerically fine for ordinary
+        # B*T*D activations, but it materializes a second full B*S*T*D tensor
+        # for the identity-stream path.  Run the same layer-norm operation
+        # with autocast disabled and matching affine dtypes so the output
+        # stays in the input dtype.  The normalization formula is unchanged.
+        if (
+            self.preserve_input_dtype
+            and input.is_cuda
+            and input.dtype in (torch.float16, torch.bfloat16)
+        ):
+            with torch.autocast(device_type=input.device.type, enabled=False):
+                weight = self.weight.to(dtype=input.dtype)
+                bias = None if self.bias is None else self.bias.to(dtype=input.dtype)
+                return F.layer_norm(input, self.weight.shape, weight, bias, 1e-5)
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 class CausalSelfAttention(nn.Module):
@@ -180,6 +197,11 @@ class GPTConfig:
     mhc_h_res_offdiag_init_scale: float = 0.05
     mhc_h_res_offdiag_trainable: bool = True
     mhc_disable_dynamic_h_res: bool = False
+    mhc_disable_dynamic_pre_post: bool = False
+    mhc_disable_dynamic_h_pre: bool = False
+    mhc_disable_dynamic_h_post: bool = False
+    mhc_stream_dtype: str | None = None
+    mhc_stream_chunk_size: int = 1024
     mhc_adapter_base_streams: int = 4
     mhc_adapter_epsilon: float = 0.1
     mhc_adapter_cap: float = 1.0
@@ -201,11 +223,23 @@ class GPT(nn.Module):
         self.config = config
 
         effective_identity_h_res = config.mhc_identity_h_res or config.mhc_train_only_pre_post
-
-        hc_kwargs = dict(
-            mhc_gate_fn=config.mhc_gate_fn,
-            mhc_identity_h_res=effective_identity_h_res,
+        self.identity_stream_compressed = (
+            config.hyper_conn_type == "mhc"
+            and effective_identity_h_res
+            and (
+                config.mhc_disable_dynamic_pre_post
+                or (config.mhc_disable_dynamic_h_pre and config.mhc_disable_dynamic_h_post)
+            )
+            and config.hyper_conn_reduce_stream_mode in {"sum", "mean", "4mean"}
+            and config.dropout == 0.0
         )
+
+        hc_kwargs = {}
+        if config.hyper_conn_type in ("mhc", "mhc_lite", "analysis"):
+            hc_kwargs.update(
+                mhc_gate_fn=config.mhc_gate_fn,
+                mhc_identity_h_res=effective_identity_h_res,
+            )
         block_depth_memory = None
         if config.hyper_conn_type == "mhc":
             hc_kwargs.update(
@@ -226,6 +260,11 @@ class GPT(nn.Module):
                 mhc_h_res_offdiag_init_scale=config.mhc_h_res_offdiag_init_scale,
                 mhc_h_res_offdiag_trainable=config.mhc_h_res_offdiag_trainable,
                 mhc_disable_dynamic_h_res=config.mhc_disable_dynamic_h_res,
+                mhc_disable_dynamic_pre_post=config.mhc_disable_dynamic_pre_post,
+                mhc_disable_dynamic_h_pre=config.mhc_disable_dynamic_h_pre,
+                mhc_disable_dynamic_h_post=config.mhc_disable_dynamic_h_post,
+                mhc_identity_stream_compressed=self.identity_stream_compressed,
+                mhc_stream_chunk_size=config.mhc_stream_chunk_size,
                 mhc_adapter_base_streams=config.mhc_adapter_base_streams,
                 mhc_adapter_epsilon=config.mhc_adapter_epsilon,
                 mhc_adapter_cap=config.mhc_adapter_cap,
@@ -255,12 +294,16 @@ class GPT(nn.Module):
             init_hc, expand_stream, reduce_stream = None, None, None
             attn_res_mixer = AttentionResidualMixer(num_steps=2 * config.n_layer, dim=config.n_embd)
         else:
+            stream_kwargs = {}
+            if config.hyper_conn_type == "mhc":
+                stream_kwargs["stream_dtype"] = config.mhc_stream_dtype
             init_hc, expand_stream, reduce_stream = hyper_conn_init_func(
                 config.hyper_conn_type,
                 config.hyper_conn_n,
                 dim=config.n_embd,
                 reduce_stream_mode=config.hyper_conn_reduce_stream_mode,
                 expand_stream_mode=config.hyper_conn_expand_stream_mode,
+                **stream_kwargs,
                 **hc_kwargs,
             )
             if config.hyper_conn_type == "mhc_lite" and config.mhc_lite_method == "depth_attn":
@@ -295,7 +338,18 @@ class GPT(nn.Module):
                     step_offset=2 * i,
                 ) for i in range(config.n_layer)
             ]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            # Keep the final normalization in the residual-stream dtype.  In
+            # the identity/no-dynamic path this avoids a full FP32 B*S*T*D
+            # output before stream reduction.
+            ln_f = LayerNorm(
+                config.n_embd,
+                bias=config.bias,
+                preserve_input_dtype=(
+                    config.hyper_conn_type == "mhc"
+                    and config.mhc_identity_h_res
+                    and config.mhc_disable_dynamic_pre_post
+                ),
+            ),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -356,8 +410,16 @@ class GPT(nn.Module):
             x = self.attn_res_mixer.finalize()
         if self.block_depth_memory is not None:
             self.block_depth_memory.clear()
-        x = self.transformer.ln_f(x)
-        if self.reduce_stream is not None:
+        compressed_state = isinstance(x, IdentityStreamState)
+        if compressed_state:
+            x = x.reduce(
+                self.transformer.ln_f,
+                self.config.hyper_conn_reduce_stream_mode,
+                self.config.mhc_stream_chunk_size,
+            )
+        else:
+            x = self.transformer.ln_f(x)
+        if self.reduce_stream is not None and not compressed_state:
             x = self.reduce_stream(x)
 
         if targets is not None:

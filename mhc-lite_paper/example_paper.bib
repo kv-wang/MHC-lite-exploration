@@ -1,0 +1,357 @@
+@inproceedings{langley00,
+ author    = {P. Langley},
+ title     = {Crafting Papers on Machine Learning},
+ year      = {2000},
+ pages     = {1207--1216},
+ editor    = {Pat Langley},
+ booktitle     = {Proceedings of the 17th International Conference
+              on Machine Learning (ICML 2000)},
+ address   = {Stanford, CA},
+ publisher = {Morgan Kaufmann}
+}
+
+@inbook{Neumann53,
+title = {1. A Certain Zero-sum Two-person Game Equivalent to the Optimal Assignment Problem},
+booktitle = {Contributions to the Theory of Games, Volume II},
+author = {John von Neumann},
+editor = {Harold William Kuhn and Albert William Tucker},
+publisher = {Princeton University Press},
+address = {Princeton},
+pages = {5--12},
+doi = {doi:10.1515/9781400881970-002},
+isbn = {9781400881970},
+year = {1953},
+lastchecked = {2026-01-05}
+}
+
+@inproceedings{lsw,
+author = {Linial, Nathan and Samorodnitsky, Alex and Wigderson, Avi},
+title = {A deterministic strongly polynomial algorithm for matrix scaling and approximate permanents},
+year = {1998},
+isbn = {0897919629},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+doi = {10.1145/276698.276880},
+booktitle = {Proceedings of the Thirtieth Annual ACM Symposium on Theory of Computing},
+pages = {644–652},
+numpages = {9},
+location = {Dallas, Texas, USA},
+series = {STOC '98}
+}
+
+
+
+
+
+
+@article{knight2008sinkhorn,
+author = {Knight, Philip A.},
+title = {The Sinkhorn–Knopp Algorithm: Convergence and Applications},
+journal = {SIAM Journal on Matrix Analysis and Applications},
+volume = {30},
+number = {1},
+pages = {261-275},
+year = {2008},
+doi = {10.1137/060659624},
+eprint = {https://doi.org/10.1137/060659624}
+}
+
+
+@article{Chakrabarty21,
+author = {Chakrabarty, Deeparnab and Khanna, Sanjeev},
+title = {Better and simpler error analysis of the Sinkhorn–Knopp algorithm for matrix scaling},
+year = {2021},
+issue_date = {Jul 2021},
+publisher = {Springer-Verlag},
+address = {Berlin, Heidelberg},
+volume = {188},
+number = {1},
+issn = {0025-5610},
+doi = {10.1007/s10107-020-01503-3},
+abstract = {Given a non-negative n\texttimes{}m real matrix A, the matrix scaling problem is to determine if it is possible to scale the rows and columns so that each row and each column sums to a specified positive target values. The Sinkhorn–Knopp algorithm is a simple and classic procedure which alternately scales all rows and all columns to meet these targets. The focus of this paper is the worst-case theoretical analysis of this algorithm. We present an elementary convergence analysis for this algorithm that improves upon the previous best bound. In a nutshell, our approach is to show (i) a simple bound on the number of iterations needed so that the KL-divergence between the current row-sums and the target row-sums drops below a specified threshold δ, and (ii) then show that for a suitable choice of δ, whenever KL-divergence is below δ, then the ℓ1-error or the ℓ2-error is below ε. The well-known Pinsker’s inequality immediately allows us to translate a bound on the KL divergence to a bound on ℓ1-error. To bound the ℓ2-error in terms of the KL-divergence, we establish a new inequality, referred to as (KL vs ℓ1/ℓ2). This inequality is a strengthening of Pinsker’s inequality and may be of independent interest.},
+journal = {Math. Program.},
+month = jul,
+pages = {395–407},
+numpages = {13},
+keywords = {68W40, 68Q25, Matchings, KL divergence, Alternate minimization, Matrix scaling}
+}
+
+@inproceedings{
+wang2025,
+title={1000 Layer Networks for Self-Supervised {RL}: Scaling Depth Can Enable New Goal-Reaching Capabilities},
+author={Kevin Wang and Ishaan Javali and Micha{\l} Bortkiewicz and Tomasz Trzcinski and Benjamin Eysenbach},
+booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
+year={2025},
+}
+
+@inbook{rmsnorm,
+author = {Zhang, Biao and Sennrich, Rico},
+title = {Root mean square layer normalization},
+year = {2019},
+publisher = {Curran Associates Inc.},
+address = {Red Hook, NY, USA},
+abstract = {Layer normalization (LayerNorm) has been successfully applied to various deep neural networks to help stabilize training and boost model convergence because of its capability in handling re-centering and re-scaling of both inputs and weight matrix. However, the computational overhead introduced by LayerNorm makes these improvements expensive and significantly slows the underlying network, e.g. RNN in particular. In this paper, we hypothesize that re-centering invariance in LayerNorm is dispensable and propose root mean square layer normalization, or RMSNorm. RMSNorm regularizes the summed inputs to a neuron in one layer according to root mean square (RMS), giving the model re-scaling invariance property and implicit learning rate adaptation ability. RMSNorm is computationally simpler and thus more efficient than LayerNorm. We also present partial RMSNorm, or pRMSNorm where the RMS is estimated from p\% of the summed inputs without breaking the above properties. Extensive experiments on several tasks using diverse network architectures show that RMSNorm achieves comparable performance against LayerNorm but reduces the running time by 7\%~64\% on different models. Source code is available at https://github.com/bzhangGo/rmsnorm.},
+booktitle = {Proceedings of the 33rd International Conference on Neural Information Processing Systems},
+articleno = {1110},
+numpages = {12}
+}
+
+@misc{karpathy2022nanogpt,
+  author       = {nanoGPT},
+  title        = {nanoGPT},
+  year         = {2022},
+  howpublished = {\url{https://github.com/karpathy/nanoGPT}},
+  note         = {GitHub repository}
+}
+
+@misc{liu2025th,
+      title={Thoughtbubbles: an Unsupervised Method for Parallel Thinking in Latent Space}, 
+      author={Houjun Liu and Shikhar Murty and Christopher D. Manning and Róbert Csordás},
+      year={2025},
+      eprint={2510.00219},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+}
+
+@inproceedings{
+bhendawade2025mr,
+title={M2R2: {EFFICIENT} {TRANSFORMERS} {WITH} {MIXTURE} {OF} {MULTI}-{RATE} {RESIDUALS}},
+author={Nikhil Bhendawade and Mahyar Najibi and Devang Naik and Irina Belousova},
+booktitle={First Workshop on Scalable Optimization for Efficient and Adaptive Foundation Models},
+year={2025},
+}
+
+@inproceedings{
+mak2025residual,
+title={Residual Matrix Transformers: Scaling the Size of the Residual Stream},
+author={Brian Mak and Jeffrey Flanigan},
+booktitle={Forty-second International Conference on Machine Learning},
+year={2025},
+}
+
+@misc{
+xie2024residual,
+title={ResiDual: Transformer with Dual Residual Connections},
+author={Shufang Xie and Huishuai Zhang and Junliang Guo and Xu Tan and Jiang Bian and Hany Hassan Awadalla and Arul Menezes and Tao Qin and Rui Yan},
+year={2024},
+}
+
+@InProceedings{he2016identity,
+author="He, Kaiming
+and Zhang, Xiangyu
+and Ren, Shaoqing
+and Sun, Jian",
+editor="Leibe, Bastian
+and Matas, Jiri
+and Sebe, Nicu
+and Welling, Max",
+title="Identity Mappings in Deep Residual Networks",
+booktitle="Computer Vision -- ECCV 2016",
+year="2016",
+publisher="Springer International Publishing",
+address="Cham",
+pages="630--645",
+abstract="Deep residual networks have emerged as a family of extremely deep architectures showing compelling accuracy and nice convergence behaviors. In this paper, we analyze the propagation formulations behind the residual building blocks, which suggest that the forward and backward signals can be directly propagated from one block to any other block, when using identity mappings as the skip connections and after-addition activation. A series of ablation experiments support the importance of these identity mappings. This motivates us to propose a new residual unit, which makes training easier and improves generalization. We report improved results using a 1001-layer ResNet on CIFAR-10 (4.62 {\%} error) and CIFAR-100, and a 200-layer ResNet on ImageNet. Code is available at: https://github.com/KaimingHe/resnet-1k-layers.",
+isbn="978-3-319-46493-0"
+}
+
+
+
+@misc{touvron2023llama,
+      title={LLaMA: Open and Efficient Foundation Language Models}, 
+      author={Hugo Touvron and Thibaut Lavril and Gautier Izacard and Xavier Martinet and Marie-Anne Lachaux and Timothée Lacroix and Baptiste Rozière and Naman Goyal and Eric Hambro and Faisal Azhar and Aurelien Rodriguez and Armand Joulin and Edouard Grave and Guillaume Lample},
+      year={2023},
+      eprint={2302.13971},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+}
+
+@inproceedings{brown2020language,
+ author = {Brown, Tom and Mann, Benjamin and Ryder, Nick and Subbiah, Melanie and Kaplan, Jared D and Dhariwal, Prafulla and Neelakantan, Arvind and Shyam, Pranav and Sastry, Girish and Askell, Amanda and Agarwal, Sandhini and Herbert-Voss, Ariel and Krueger, Gretchen and Henighan, Tom and Child, Rewon and Ramesh, Aditya and Ziegler, Daniel and Wu, Jeffrey and Winter, Clemens and Hesse, Chris and Chen, Mark and Sigler, Eric and Litwin, Mateusz and Gray, Scott and Chess, Benjamin and Clark, Jack and Berner, Christopher and McCandlish, Sam and Radford, Alec and Sutskever, Ilya and Amodei, Dario},
+ booktitle = {Advances in Neural Information Processing Systems},
+ editor = {H. Larochelle and M. Ranzato and R. Hadsell and M.F. Balcan and H. Lin},
+ pages = {1877--1901},
+ publisher = {Curran Associates, Inc.},
+ title = {Language Models are Few-Shot Learners},
+ volume = {33},
+ year = {2020}
+}
+
+
+@article{FRANKLIN1989717,
+title = {On the scaling of multidimensional matrices},
+journal = {Linear Algebra and its Applications},
+volume = {114-115},
+pages = {717-735},
+year = {1989},
+note = {Special Issue Dedicated to Alan J. Hoffman},
+issn = {0024-3795},
+doi = {https://doi.org/10.1016/0024-3795(89)90490-4},
+author = {Joel Franklin and Jens Lorenz},
+abstract = {Elementary proofs are given for theorems of Bapat and Raghavan on the scaling of nonnegative multidimensional matrices. Theorems of Sinkhorn and of Brualdi, Parter, and Schneider are derived as corollaries. For positive two-dimensional matrices, Hilbert's projective metric and a theorem of G. Birkhoff are used to prove that Sinkhorn's original iterative procedure converges geometrically; the ratio of convergence is estimated from the given data.}
+}
+
+@inproceedings{vaswani2017attention,
+ author = {Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N and Kaiser, \L ukasz and Polosukhin, Illia},
+ booktitle = {Advances in Neural Information Processing Systems},
+ editor = {I. Guyon and U. Von Luxburg and S. Bengio and H. Wallach and R. Fergus and S. Vishwanathan and R. Garnett},
+ pages = {},
+ publisher = {Curran Associates, Inc.},
+ title = {Attention is All you Need},
+ volume = {30},
+ year = {2017}
+}
+
+
+@article{skalgo,
+author = {Paul Knopp and Richard Sinkhorn},
+title = {{Concerning nonnegative matrices and doubly stochastic matrices.}},
+volume = {21},
+journal = {Pacific Journal of Mathematics},
+number = {2},
+publisher = {Pacific Journal of Mathematics, A Non-profit Corporation},
+pages = {343 -- 348},
+year = {1967},
+}
+
+
+@Article{Birkhoff,
+  author =       "Garrett Birkhoff",
+  title =        "Tres observaciones sobre el algebra lineal.
+                 ({Spanish}) [{Three} observations on linear algebra]",
+  journal =      "Univ. Nac. Tucum{\'a}n. Revista A.",
+  volume =       "5",
+  pages =        "147--151",
+  year =         "1946",
+  MRclass =      "09.1X",
+  MRnumber =     "20547",
+  MRreviewer =   "J. L. Dorroh",
+  bibdate =      "Sun Oct 22 09:59:52 2023",
+  bibsource =    "https://www.math.utah.edu/pub/bibnet/authors/b/birkhoff-garrett.bib",
+  acknowledgement = ack-nhfb,
+  author-dates = "Garrett Birkhoff (19 January 1911--22 November 1996)",
+  fjournal =     "Universidad Nacional de Tucum{\'a}n. Facultad de
+                 Ciencias Exactas y Tecnolog{\'\i}a. Revista. Serie A.
+                 Matem{\'a}tica y F{\'\i}sica Te{\'o}rica",
+  fjournal-2 =   "Univ. Nac. Tucum{\'a}n. Revista A.",
+  GB-number =    "53",
+  xxpages =      "145--151",
+  xxtitle =      "Tres notas sobre el algebra lineal",
+}
+
+
+@inproceedings{transformer,title	= {Attention is All You Need},author	= {Ashish Vaswani and Noam Shazeer and Niki Parmar and Jakob Uszkoreit and Llion Jones and Aidan N. Gomez and Lukasz Kaiser and Illia Polosukhin},year	= {2017},}
+
+@Article{Zhu2024HyperConnections,
+ author = {Defa Zhu and Hongzhi Huang and Zihao Huang and Yutao Zeng and Yunyao Mao and Banggu Wu and Qiyang Min and Xun Zhou},
+ booktitle = {arXiv.org},
+ journal = {ArXiv},
+ title = {Hyper-Connections},
+ volume = {abs/2409.19606},
+ year = {2024}
+}
+
+@INPROCEEDINGS{he2016deep,
+  author={He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Sun, Jian},
+  booktitle={2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}, 
+  title={Deep Residual Learning for Image Recognition}, 
+  year={2016},
+  volume={},
+  number={},
+  pages={770-778},
+  keywords={Training;Degradation;Complexity theory;Image recognition;Neural networks;Visualization;Image segmentation},
+  doi={10.1109/CVPR.2016.90}}
+
+
+@misc{xie25mhc,
+      title={mHC: Manifold-Constrained Hyper-Connections}, 
+      author={Zhenda Xie and Yixuan Wei and Huanqi Cao and Chenggang Zhao and Chengqi Deng and Jiashi Li and Damai Dai and Huazuo Gao and Jiang Chang and Liang Zhao and Shangyan Zhou and Zhean Xu and Zhengyan Zhang and Wangding Zeng and Shengding Hu and Yuqing Wang and Jingyang Yuan and Lean Wang and Wenfeng Liang},
+      year={2025},
+      eprint={2512.24880},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+}
+
+@TechReport{mitchell80,
+  author = 	 "T. M. Mitchell",
+  title = 	 "The Need for Biases in Learning Generalizations",
+  institution =  "Computer Science Department, Rutgers University",
+  year = 	 "1980",
+  address =	 "New Brunswick, MA",
+}
+
+@phdthesis{kearns89,
+  author = {M. J. Kearns},
+  title =  {Computational Complexity of Machine Learning},
+  school = {Department of Computer Science, Harvard University},
+  year =   {1989}
+}
+
+@Book{MachineLearningI,
+  editor = 	 "R. S. Michalski and J. G. Carbonell and T.
+		  M. Mitchell",
+  title = 	 "Machine Learning: An Artificial Intelligence
+		  Approach, Vol. I",
+  publisher = 	 "Tioga",
+  year = 	 "1983",
+  address =	 "Palo Alto, CA"
+}
+
+@Book{DudaHart2nd,
+  author =       "R. O. Duda and P. E. Hart and D. G. Stork",
+  title =        "Pattern Classification",
+  publisher =    "John Wiley and Sons",
+  edition =      "2nd",
+  year =         "2000"
+}
+
+@misc{anonymous,
+  title= {Suppressed for Anonymity},
+  author= {Author, N. N.},
+  year= {2021}
+}
+
+@InCollection{Newell81,
+  author =       "A. Newell and P. S. Rosenbloom",
+  title =        "Mechanisms of Skill Acquisition and the Law of
+                  Practice", 
+  booktitle =    "Cognitive Skills and Their Acquisition",
+  pages =        "1--51",
+  publisher =    "Lawrence Erlbaum Associates, Inc.",
+  year =         "1981",
+  editor =       "J. R. Anderson",
+  chapter =      "1",
+  address =      "Hillsdale, NJ"
+}
+
+
+@Article{Samuel59,
+  author = 	 "A. L. Samuel",
+  title = 	 "Some Studies in Machine Learning Using the Game of
+		  Checkers",
+  journal =	 "IBM Journal of Research and Development",
+  year =	 "1959",
+  volume =	 "3",
+  number =	 "3",
+  pages =	 "211--229"
+}
+@article{loshchilov2017decoupled,
+  title={Decoupled weight decay regularization},
+  author={Loshchilov, Ilya and Hutter, Frank},
+  journal={arXiv preprint arXiv:1711.05101},
+  year={2017}
+}
+
+@inproceedings{huang2017densely,
+  title={Densely connected convolutional networks},
+  author={Huang, Gao and Liu, Zhuang and Van Der Maaten, Laurens and Weinberger, Kilian Q},
+  booktitle={Proceedings of the IEEE conference on computer vision and pattern recognition},
+  pages={4700--4708},
+  year={2017}
+}
+@article{srivastava2015highway,
+  title={Highway networks},
+  author={Srivastava, Rupesh Kumar and Greff, Klaus and Schmidhuber, J{\"u}rgen},
+  journal={arXiv preprint arXiv:1505.00387},
+  year={2015}
+}

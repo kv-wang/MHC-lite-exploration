@@ -1,0 +1,103 @@
+
+
+\section{Methodology}
+\label{sec: method}
+As discussed in Section~\ref{sec: intro}, \mHC's reliance on a finite number of SK iterations raises concerns regarding portability and stability. 
+From a system perspective, achieving competitive efficiency for SK iterations typically relies on specialized, fused CUDA kernels, making this component difficult to serve as a drop-in replacement for standard residual connections across different frameworks.
+Beyond portability, a more fundamental issue lies in the stability of the residual matrices.
+In particular, finite-step approximation can lead to non-negligible deviations from exact doubly stochasticity, which may accumulate across depth and undermine the stability that \mHC aims to achieve.
+We analyze this stability issue in detail in Section~\ref{subsec: stablity}.
+These observations together motivate a re-parameterization in Section~\ref{subsec: mhc-lite}, which ensures exact doubly stochasticity by construction and avoids heavy customization of CUDA kernels.
+
+\subsection{Analysis of the Stability}
+\label{subsec: stablity}
+In \mHC, a fixed number of SK iterations (e.g., 20 iterations in \mHC) does not guarantee a high-quality approximation when the convergence is slow.
+Classical studies on matrix scaling show that SK is not uniformly fast in general~\cite{lsw,knight2008sinkhorn,Chakrabarty21}.
+For general nonnegative matrices, the SK algorithm only comes with a worst-case iteration bound as follows: to obtain an approximation of doubly stochasticity whose $\ell_1$-error~\footnote{This bound follows from Corollary 2 in~\cite{Chakrabarty21}. Here, the $\ell_1$-error indicates the summation of the errors of all the column/raw sums, i.e., $\ell_1\text{-error}({\boldsymbol{X} })
+:= \|\boldsymbol{X}\mathbf 1_n - \mathbf 1_n\|_{\ell_1}
+ + \|\boldsymbol{X}^{\top}\mathbf 1_n - \mathbf 1_n\|_{\ell_1}$.} is at most $\epsilon$, it may require up to $O\left(\frac{n^2\log (n/\nu)}{\epsilon ^2}\right)$ iterations, where the relative range $\nu$ is defined by
+\begin{align}
+\nu := \frac{\displaystyle\min_{i,j:\,x_{i,j} > 0} x_{i,j}}{\displaystyle\max_{i,j} x_{i,j}},\label{eq:nu}
+\end{align}
+where $x_{i,j}$ is the $(i,j)$-th entry of ${\boldsymbol{X}}$. Even for strictly positive matrices, convergence remains sensitive to $1/\nu$ and can be extremely slow when $1/\nu$ is large~\cite{lsw} (see the example in Section~\ref{sec: intro}).
+
+This issue is practically relevant in \mHC.
+As shown in Equation~(\ref{eq: skexp}), the SK input is obtained by exponentiating an affine function of the features, which can yield ill-conditioned matrices with very large relative range.
+In our measurements (Figure~\ref{fig:nu}), approximately $27.9\%$ of SK inputs satisfy $1/\nu \ge 10^{13}$.
+Under such inputs, a fixed SK budget may fail to produce a near-doubly-stochastic matrix.
+Figure~\ref{fig:h_res} shows that the column sum of a single residual matrix in \mHC may deviate from $1$ by up to $100\%$. 
+More importantly, these per-layer deviations can accumulate through depth: Figure~\ref{fig:h_res} shows that the column sums of $\prod_l \boldsymbol{H}^{\text{res}}_l$ may deviate from $1$ by up to $220\%$ in a $24$-layer network, implying the risks of instability when models further scale up. In practice, a latest model constructs a 1{,}000-layer network for self-supervised reinforcement learning~\cite{wang2025} based on the classical identity residual connection~\cite{he2016deep}.
+This empirical trend indicates the importance of stable residual matrices with theoretical guarantees. 
+
+
+\begin{figure*}[th]
+\begin{minipage}{0.49\linewidth}
+    \centering
+    \includegraphics[width=1\linewidth]{figures/large_fineweb_gnorm.pdf}
+\end{minipage}
+\begin{minipage}{0.49\linewidth}
+    \centering
+    \includegraphics[width=1\linewidth]{figures/large_fineweb_gnorm_avg.pdf}
+    
+\end{minipage}
+\caption{\textbf{Gradient-norm dynamics during training.} We compare the evolution of gradient norms over the course of training. \textbf{Left:} overall trajectories, showing that both \mHC and \mHC-lite exhibit substantially smaller gradient norms (and improved stability) than HC. \textbf{Right:} a zoomed-in view of \mHC and \mHC-lite; curves are smoothed using a 200-step moving average, and the shaded region indicates the standard deviation within the same window. From the zoomed-in view, it is clear that \mHC-lite yields a smaller mean gradient norm and reduced fluctuations compared to \mHC. Results are obtained with the \textsf{L} model on the \texttt{FineWeb-Edu} dataset.}
+    \label{fig:grad-norm}
+\end{figure*}
+\begin{table*}[thbp]
+\centering
+{\setlength{\tabcolsep}{4pt}\begin{tabular}{lcc cc cc  cc cc cc}
+\toprule
+Dataset
+& \multicolumn{6}{c}{\texttt{OpenWebText}}
+& \multicolumn{6}{c}{\texttt{FineWeb-Edu}} \\
+\cmidrule(lr){2-7}\cmidrule(lr){8-13}
+Model Scale
+& \multicolumn{2}{c}{\sf{S}} & \multicolumn{2}{c}{\sf{M}} & \multicolumn{2}{c}{\sf{L}}
+& \multicolumn{2}{c}{\sf{S}} & \multicolumn{2}{c}{\sf{M}} & \multicolumn{2}{c}{\sf{L}} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+\cmidrule(lr){8-9}\cmidrule(lr){10-11}\cmidrule(lr){12-13}
+& Train & Val & Train & Val & Train & Val
+& Train & Val & Train & Val & Train & Val \\
+\midrule
+Residual & 3.566 & 3.562 & 3.343 & 3.336 & 3.237 & 3.242 & 3.526 & 3.536 & 3.316 & 3.321 & 3.238 & 3.240 \\
+HC       & 3.475 & 3.471 & 3.272 & 3.264 & 3.244 & 3.248 & 3.463 & \textbf{3.473} & 3.266 & 3.273 & 3.241 & 3.244 \\
+\mHC      & 3.474 & 3.469 & 3.267 & 3.259 & \textbf{3.191} & \textbf{3.198} &  \textbf{3.462} & \textbf{3.473} & \textbf{3.237} & \textbf{3.243} & 3.200 & 3.204  \\
+\mHC-lite & \textbf{3.471} & \textbf{3.467} & \textbf{3.261} & 
+\textbf{3.255} & 3.194 & \textbf{3.198} & 3.468 & 3.477 & 3.243 & 3.249 & \textbf{3.181} & \textbf{3.185}  \\
+\bottomrule
+\end{tabular}}
+\vspace{0.5em}
+\caption{\textbf{Loss of trained models.} We report training and validation loss at the end of training. To mitigate stochastic fluctuations, training loss is computed as a moving average over the last 200 iterations.}\label{tab:loss}
+\end{table*}
+
+\subsection{Re-parameterization and \mHC-lite}
+\label{subsec: mhc-lite}
+Our methodology is based on the Birkhoff-von Neumann Theorem~\cite{Birkhoff,Neumann53}, which is also highlighted by \mHC~\cite{xie25mhc}.
+To keep the paper self-contained, we restate the theorem as follows.
+\begin{theorem}[The Birkhoff-von Neumann theorem]
+For any $\boldsymbol{X}\in\mathcal{B}_n$, there exists a weight $\mathbf{a}=(a_1,...,a_{n!}) \in \mathbb{R}^{1\times n!}$, where $a_k \ge 0,\forall k\in [n!], \|\mathbf{a}\|_{\ell_1}=1$, such that 
+$$\boldsymbol{X} = \sum_{i=1}^{n!}a_k \boldsymbol{P}_k$$
+where $\left\{\boldsymbol{P}_k\right\}_{k=1}^{n!}$ is the sequence of $n\times n$ permutation matrices. 
+\end{theorem}
+
+Based on the Birkhoff-von Neumann theorem, we directly represent doubly stochastic matrices as convex combinations of permutation matrices. 
+This parameterization guarantees that the matrix is precise doubly stochastic. Furthermore, by eliminating iterative approximations, the parameterization removes their computational overhead in both training and inferencing, avoiding the heavy reliance of highly specialized infrastructures.
+
+
+In \mHC-lite, to control for confounding factors, we keep the structure of \mHC unchanged, except for ${\boldsymbol{H}}^{\text{\text{res}}}_l$.
+Let $\boldsymbol{x}_l\in \mathbb{R}^{n\times C}$ denote the input feature in the $l$-th layer and $\boldsymbol{\hat x}_l\in \mathbb{R}^{1\times nC}$ denote the flatten input feature. Then we build mappings ${\boldsymbol{H}}^{\text{\text{res}}}_l,{\boldsymbol{H}}^{\text{\text{pre}}}_l$ and ${\boldsymbol{H}}^{\text{\text{post}}}_l$ dynamically based on $\boldsymbol{x}_l$ as follows. 
+\begin{align}
+    {\boldsymbol{\hat x}_l'} &= \mathop{ \mathrm{ RMSNorm } } (\boldsymbol{\hat x}_l) \notag
+    \\ {\boldsymbol{H}}^{\text{\text{pre}}}_l &= \mathop{ \mathrm{ sigmoid } }\left({\alpha^{\text{pre}}_l}{\boldsymbol{\hat x}_l'}\boldsymbol{W}^{\text{\text{pre}}}_l + \boldsymbol{b}_l^{\text{pre}}\right) \notag
+    \\ {\boldsymbol{H}}^{\text{\text{post}}}_l &= 2\cdot \mathop{ \mathrm{ sigmoid } }\left({\alpha^{\text{post}}_l}{\boldsymbol{\hat x}_l'}\boldsymbol{W}^{\text{\text{post}}}_l + \boldsymbol{b}_l^{\text{post}}\right) \notag 
+    \\ \boldsymbol{a}_{l} &=\mathop{ \mathrm{ softmax } }\left({\alpha^{\text{res}}_l}{\boldsymbol{\hat x}_l'}\boldsymbol{W}^{\text{\text{res}}}_l + \boldsymbol{b}_l^{\text{res}}\right) \label{eq: a} 
+    \\ {\boldsymbol{H}}^{\text{\text{res}}}_l &= \sum_{k=1}^{n!}  a_{l,k}\boldsymbol{P}_k \label{eq: convex comb}
+\end{align}
+where $\boldsymbol{W}^{\text{\text{pre}}}_l,\boldsymbol{W}^{\text{\text{post}}}_l\in \mathbb{R}^{nC\times n}$ and $\boldsymbol{W}^{\text{\text{res}}}_l\in \mathbb{R}^{nC\times n!}$ are learnable weight matrices in the $l$-th layer. Here $\boldsymbol{b}^{\text{pre}}_l, \boldsymbol{b}^{\text{post}}_l\in \mathbb{R}^{1\times n}$ and $\boldsymbol{b}^{\text{res}}_l\in \mathbb{R}^{1\times n!}$ are learnable bias. The terms ${\alpha^{\text{pre}}_l},{\alpha^{\text{post}}_l}$ and ${\alpha^{\text{res}}_l}$ are learnable scalars. 
+The $\mathop{ \mathrm{ RMSNorm } }(\cdot)$ refers to the RMSNorm~\cite{rmsnorm}.
+
+In practice, we first compute a dynamic weight vector $\boldsymbol{a}_{l}=(a_{l,1},\ldots,a_{l,n!})\in\mathbb{R}^{n!}$ via a linear layer with softmax activations. Recall that $n$ denotes the number of residual streams, which is $n=4$ in HC and \mHC~\cite{Zhu2024HyperConnections,xie25mhc}, so $n!=24$ is a small constant. To produce ${\boldsymbol{H}}^{\text{\text{res}}}_l$, Equation~\ref{eq: convex comb} is implemented via a matrix multiplication between $\boldsymbol{a}_l^{\text{res}}$ and a constant 0/1 matrix in $\mathbb{R}^{n!\times n^2}$, which is reshaped from the concatenation of all permutation matrices. 
+
+Like HC and \mHC~\cite{xie2024residual,Zhu2024HyperConnections}, the additional FLOPs introduced by the residual connection are typically negligible compared to those of the main transformation $f(\cdot;\mathcal{W}_l)$. For instance, in Transformer architectures~\cite{vaswani2017attention}, $f(\cdot;\mathcal{W}_l)$ corresponds to the attention and MLP operator, which dominates the compute. 
+Our key advantage in the computation, instead, is engineering-oriented: the construction can be implemented entirely with standard operators, avoiding reliance on specialized kernels for repeated iterations, and is thus more generally portable across frameworks.
+

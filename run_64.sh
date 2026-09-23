@@ -21,7 +21,7 @@ export DDP_TIMEOUT="${DDP_TIMEOUT:-1800}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-export WANDB_API_KEY="${WANDB_API_KEY:-}"
+export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.bandw.top}"
 
 N_GPUS="${N_GPUS:-4}"
@@ -79,6 +79,9 @@ run_method() {
     small)
       model_config="config/small_model.py"
       ;;
+    medium)
+      model_config="config/medium_model.py"
+      ;;
     large)
       model_config="config/large_model.py"
       ;;
@@ -117,7 +120,7 @@ run_method() {
       method_desc="${model_name} mHC identity H_res"
       wandb_run_name="mhc-${model_name}-mhc-identity-${N_STREAMS}streams-reduce-${REDUCE_STREAM_MODE}-${MAX_ITERS}iter"
       out_prefix_method="mhc-identity-${N_STREAMS}streams-reduce-${REDUCE_STREAM_MODE}-${MAX_ITERS}iter"
-      extra_method_args+=(--mhc_train_only_pre_post=True)
+      extra_method_args+=(--mhc_identity_h_res=True)
       ;;
     *)
       echo "Unknown method: $method" >&2
@@ -168,7 +171,7 @@ run_method() {
 
 EXTRA_ARGS=("$@")
 
-run_method large identity_tanh_offdiag
+run_method small identity_tanh_offdiag
 
 echo ""
 echo "================================================================"

@@ -1,0 +1,13 @@
+module_ordinal,layer_index,component,module_name,h_res_source,kkt_pass,primal_feasible_pass,row_sum_abs_err_max,col_sum_abs_err_max,min_entry,offdiag_max,grad_l2_norm,base_linear_value,best_perm_linear_value,min_perm_directional_derivative,best_perm
+3,3,mlp,transformer.h.1.hc_mlp,identity_h_res_forward,False,True,0.0,0.0,0.0,0.0,0.05025050789117813,-0.0008983993902802467,-0.021354222670197487,-0.02045582327991724,"[3, 0, 2, 1]"
+5,5,mlp,transformer.h.2.hc_mlp,identity_h_res_forward,False,True,0.0,0.0,0.0,0.0,0.06058894842863083,0.013008961454033852,-0.004512944258749485,-0.017521905712783337,"[3, 0, 2, 1]"
+4,4,attn,transformer.h.2.hc_attn,identity_h_res_forward,False,True,0.0,0.0,0.0,0.0,0.04787318408489227,0.010528633370995522,-0.0017275118734687567,-0.012256145244464278,"[1, 2, 0, 3]"
+2,2,attn,transformer.h.1.hc_attn,identity_h_res_forward,False,True,0.0,0.0,0.0,0.0,0.01700192131102085,0.016711600124835968,0.0047104936093091965,-0.012001106515526772,"[3, 0, 2, 1]"
+6,6,attn,transformer.h.3.hc_attn,identity_h_res_forward,False,True,0.0,0.0,0.0,0.0,0.028441421687602997,0.01922355219721794,0.008500555530190468,-0.010722996667027473,"[2, 0, 3, 1]"
+1,1,mlp,transformer.h.0.hc_mlp,identity_h_res_forward,False,True,0.0,0.0,0.0,0.0,0.010003543458878994,0.012566955760121346,0.003727319883182645,-0.0088396358769387,"[3, 0, 2, 1]"
+7,7,mlp,transformer.h.3.hc_mlp,identity_h_res_forward,False,True,0.0,0.0,0.0,0.0,0.04685085266828537,0.021555524319410324,0.016778679564595222,-0.004776844754815102,"[1, 0, 2, 3]"
+0,0,attn,transformer.h.0.hc_attn,identity_h_res_forward,True,True,0.0,0.0,0.0,0.0,0.010194510221481323,0.005363347474485636,0.005363347474485636,0.0,"[0, 1, 2, 3]"
+8,8,attn,transformer.h.4.hc_attn,identity_h_res_forward,True,True,0.0,0.0,0.0,0.0,0.06701510399580002,0.016609009355306625,0.016609009355306625,0.0,"[0, 1, 2, 3]"
+9,9,mlp,transformer.h.4.hc_mlp,identity_h_res_forward,True,True,0.0,0.0,0.0,0.0,0.06939512491226196,0.018431631848216057,0.018431631848216057,0.0,"[0, 1, 2, 3]"
+10,10,attn,transformer.h.5.hc_attn,identity_h_res_forward,True,True,0.0,0.0,0.0,0.0,0.07431337237358093,0.02398589998483658,0.02398589998483658,0.0,"[0, 1, 2, 3]"
+11,11,mlp,transformer.h.5.hc_mlp,identity_h_res_forward,True,True,0.0,0.0,0.0,0.0,0.1325659155845642,0.01756957732141018,0.01756957732141018,0.0,"[0, 1, 2, 3]"

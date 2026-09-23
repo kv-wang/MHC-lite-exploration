@@ -45,6 +45,7 @@ To train a model, run `train.py`. Use `torchrun` to enable distributed training 
   * mHC: `config/with_mhc.py`
   * mHC-lite: `config/with_mhc_lite.py`
   * mHC-lite Block-Depth: `config/with_mhc_lite_block_depth.py`
+  * KromHC: `config/with_kromhc.py`
   * Attention Residuals: `config/with_attn_res.py`
   * Residual: (default)
 
@@ -61,6 +62,16 @@ Train a **small (S)** model with **mHC-lite** on **OpenWebText**:
 torchrun --standalone --nproc_per_node=8 train.py \
   config/train_owt.py config/small_model.py config/with_mhc_lite.py
 ```
+
+Train KromHC with four residual streams on FineWeb-Edu:
+
+```sh
+torchrun --standalone --nproc_per_node=4 train.py \
+  config/train_fineweb_edu.py config/small_model.py config/with_kromhc.py
+```
+
+The current KromHC implementation supports residual stream widths that are
+powers of two; the provided configuration uses `n=4`.
 
 * Set `--nproc_per_node` to the number of GPUs you have.
 

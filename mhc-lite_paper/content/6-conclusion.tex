@@ -1,0 +1,13 @@
+\section{Conclusion and Discussion}
+\label{sec:conclusion}
+
+In this work, we revisit \mHC's design of residual connections from the perspective of stability and system portability. The iterative SK algorithm requires specialized kernels for efficient execution, creating engineering barrier for generic adoption. Moreover, through both theoretical analysis and empirical evaluation, we find that due to \mHC's reliance on a finite steps of SK iterations, its residual matrices may significantly deviate from doubly stochasticity, when the SK algorithm fails to converge, introducing potential risks of stability.  
+To address these limitations, we propose \textbf{\mHC-lite}, a simple, strong, and efficient alternative to \mHC, achieved by re-parameterizing doubly stochastic matrices based on the Birkhoff–von Neumann theorem. The re-parameterization enables us to skip the SK iterations entirely, removing the approximation gap and supporting the computation with only basic operators, making our method a drop-in replacement for classical residual architectures, offering guaranteed robustness without sacrificing ease of deployment.
+
+The design of \mHC-lite verifies a simple but powerful principle: exactness, when attainable, is often the most efficient form of approximation.
+This shift from ``projection'' to ``reparameterization'' ensures the constraint hold by construction, eliminating approximation gaps (such as those induced by finitely many Sinkhorn--Knopp iterations) while enabling potentially more efficient implementations. 
+
+\paragraph{On The Computational Efficiency of \mHC-lite for Larger $n$.}
+An astute reader might notice that, although \mHC performs well when $n = 4$, its space and time complexity grow exponentially with $n$, raising potential concerns about the efficiency of this method when $n$ is larger. Here, we make two observations: 1) in the original HC paper~\cite{Zhu2024HyperConnections}, the authors conducted extensive ablation studies demonstrating that $n=4$ is indeed an superior choice in practice; 2) even if a larger $n$ is required, we can readily reduce the computational cost by sampling a subset of permutation matrices rather than including all of them. This is equivalent to restricting the feasible region to a subset of the Birkhoff polytope. The resulting residual matrix remains guaranteed to be doubly stochastic, while the computational budget can be tuned by controlling the number of sampled permutations.
+
+

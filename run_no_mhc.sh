@@ -7,20 +7,20 @@
 #   N_GPUS=1 MAX_ITERS=100 ./run_no_mhc.sh
 
 set -e
-
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 export DDP_TIMEOUT="${DDP_TIMEOUT:-1800}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-export WANDB_API_KEY="${WANDB_API_KEY:-}"
+export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.bandw.top}"
 
-N_GPUS="${N_GPUS:-4}"
+N_GPUS="${N_GPUS:-1}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-config/train_owt.py}"
 MAX_ITERS="${MAX_ITERS:-10000}"
 EVAL_ITERS="${EVAL_ITERS:-200}"
-WANDB_PROJECT_PREFIX="${WANDB_PROJECT_PREFIX:-ablation_num_streams}"
+WANDB_PROJECT_PREFIX="${WANDB_PROJECT_PREFIX:-final_experiments}"
 
 echo ""
 echo "================================================================"
@@ -74,8 +74,8 @@ run_model() {
 }
 
 #run_model "small" "config/small_model.py"
-run_model "medium" "config/medium_model.py"
-#run_model "large" "config/large_model.py"
+#run_model "medium" "config/medium_model.py"
+run_model "large" "config/large_model.py"
 
 echo ""
 echo "================================================================"

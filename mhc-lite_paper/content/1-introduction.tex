@@ -1,0 +1,66 @@
+\section{Introduction}
+\label{sec: intro}
+
+\begin{figure}[th]
+    \centering
+    \includegraphics[width=.95\linewidth]{figures/figure1.pdf}
+    \caption{\textbf{Residual matrix construction in \mHC vs. \mHC-lite.} 
+    The method \mHC relies on repeated Sinkhorn–Knopp iterations to approximate doubly stochastic matrices, whereas \mHC-lite directly computes the matrix via a convex combination of permutation matrices, achieving exact doubly stochasticity.}
+\end{figure}
+
+Residual connection~\cite{he2016deep}, which adds identity mappings between every adjacent layers, is known to be critical for stabilizing the training of deep neural networks. 
+Latest advancements generalize a single stream of residual to multiple streams to add the flexibility of feature reuse across depth~\cite{xie2024residual,Zhu2024HyperConnections, mak2025residual,bhendawade2025mr,xie25mhc,liu2025th}. 
+Among these works, Hyper-Connections (HC) proposes to build dynamic residual matrices $\boldsymbol{H}^{\text{res}}_l$ to mix the information across residual streams, which enriches the expressive capacity of residual connections and accelerates the convergence~\cite{Zhu2024HyperConnections}. 
+
+Recently, researchers from DeepSeek observe that, as the training scales up, the unconstrained dynamic residual matrices may introduce risks of instability~\cite{xie25mhc}. 
+In particular, replacing the identity residual connection with a dynamic residual matrix removes the explicit guarantee of the identity property. 
+As a result, gradients could become unstable, and exploding gradients may re-emerge when non-identity mappings are repeatedly composed across depth. 
+
+To mitigate this, \citet{xie25mhc} proposes Manifold-Constrained Hyper-Connections (\mHC), which approximately constrains the dynamic residual matrices onto the Birkhoff polytope, i.e., the set of doubly stochastic matrices. 
+The doubly stochastic matrices have all their row and column sums being one, and thus, ensures that their spectral norm is bounded by 1 and that the set is closed under matrix multiplication, preventing gradient explosions in their composition in deep neural networks.
+In particular, \mHC's approximate constraint is achieved via the iterative Sinkhorn–Knopp (SK) algorithm~\cite{skalgo}, which alternately normalizes all columns and rows so that their sums equal 1. 
+
+However, \mHC's reliance on a finite number of SK iterations creates an inherent approximation gap and raises the engineering barrier to efficient adoption.
+First, based on the finite number of iterations (in the \mHC paper, 20 iterations), exact doubly stochasticity is not guaranteed.
+Classical results on matrix scaling establish that the SK algorithm can converge arbitrarily slowly for certain input matrices~\cite{lsw,knight2008sinkhorn,Chakrabarty21,FRANKLIN1989717}. 
+Thus, under a limited number of iterations, the resulting matrices may remain noticeably away from the intended constraint, potentially undermining the stability that \mHC targets.
+To make this concrete, we present a simple example adapted from~\cite{lsw}:
+\begin{align}
+\begin{pmatrix}
+\frac{1}{2} , &\alpha  , &\alpha\\
+\frac{1}{2},   &\alpha,   &\alpha\\
+\alpha,   &1,   &1 \\
+\end{pmatrix}    
+\xLongrightarrow{\text{SK (20 iters)}} 
+\begin{pmatrix}
+0.91, &0.045, &0.045\\
+0.91, &0.045, &0.045\\
+0.     ,&0.5    ,&0.5   
+\end{pmatrix}  \notag
+\end{align}
+where the input matrix is strictly positive with $\alpha=10^{-13}$.
+After 20 SK iterations, the output matrix has column sums $1.92$, $0.59$, and $0.59$, which deviates substantially from doubly stochasticity.
+In deep networks, such approximation errors can accumulate through depth, and repeated composition of these matrices may further deviate from the desired doubly stochasticity, which may introduce risks of stability. We include more detailed analysis about the approximation in Section~\ref{sec: method}. 
+
+Second, \mHC's efficiency relies on highly specialized implementations of the SK iterations, which increases engineering complexity and reduces portability across software stacks.
+To achieve competitive efficiency for running the SK iterations, it requires custom fused CUDA kernels to amortize repeated kernel launches in the forward pass, as described in~\cite{xie25mhc}.
+Moreover, to control the memory footprint, \mHC's implementation avoids storing per-iteration intermediate results in the SK algorithm and instead recomputes them during the backward pass.
+Such tightly optimized operators are less well supported by generic deep learning infrastructures.
+Taken together, these stability concerns and engineering barriers make \mHC difficult to adopt as a drop-in replacement for the classical identity residual connection~\cite{he2016deep}.
+
+Notably, while \mHC applies SK iterations to approximate doubly stochasticity, the \mHC paper itself~\cite{xie25mhc} highlights a critical fact: the Birkhoff polytope is the convex hull of the set of permutation matrices, which is known as the Birkhoff–von Neumann theorem~\cite{Birkhoff,Neumann53}. 
+Motivated by it, we propose \textbf{\mHC-lite}, which parameterizes doubly stochastic matrices with a convex combination of permutation matrices, thereby bypassing SK iterations entirely. The parameterization allows us to represent any doubly stochastic matrix by an unconstrained weight.
+This re-parameterization yields two benefits: 
+(i) it guarantees exact doubly stochasticity by construction, eliminating approximation errors; 
+(ii) it can be efficiently implemented via native matrix multiplications, removing the reliance on highly specialized kernels for iterations.
+
+We conduct extensive experiments to validate the effectiveness of \mHC-lite. Our results highlight three key advantages. First, \mHC-lite matches (and sometimes exceeds) the performance gains of \mHC, demonstrating that it is a competitive alternative. Second, unlike \mHC, \mHC-lite maintains training throughput even with a naive, unoptimized implementation, highlighting its practicality in standard training stacks. Third, we find that \mHC can still exhibit instability in practice (though less severe than HC), whereas \mHC-lite eliminates this issue entirely.
+
+In summary, our contributions are as follows:
+\begin{enumerate}
+    \item We propose \mHC-lite, a simple reparameterization of \mHC that explicitly constructs doubly stochastic residual matrices, eliminating the requirement of SK iterations, closing the approximation gap entirely, and enabling simple and fast implementation based solely on native matrix operations.
+    \item We provide both theoretical and empirical evidence that finite SK iterations in \mHC can leave a non-negligible approximation gap to the doubly stochastic constraint, showing that stability issues persist in \mHC despite the manifold constraint.
+    \item Through extensive experiments, we show that \mHC-lite matches or surpasses \mHC in downstream performance while achieving higher training throughput and removing the instabilities of the residual matrices observed in \mHC and HC.
+\end{enumerate}
+
+\textbf{Organization.} \Cref{sec:background} reviews the background on residual connection designs, highlighting the instability issue of HC and manifold-constrained remedy adopted by \mHC. \Cref{sec: method} provides an in-depth the remaining stability concerns of \mHC under finite SK iterations and introduces our proposed \mHC-lite algorithm. \Cref{sec: exp} presents experimental results that validate our claims. Finally, \Cref{sec:conclusion} concludes the paper and discusses limitations and future directions.

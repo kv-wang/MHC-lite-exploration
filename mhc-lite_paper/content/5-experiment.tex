@@ -1,0 +1,83 @@
+
+\begin{figure*}[t]
+\begin{minipage}{0.24\linewidth}\centering
+    \includegraphics[width=\linewidth]{figures/hres_small.pdf}
+    \textsf{S} model, per-matrix
+\end{minipage}
+\begin{minipage}{0.24\linewidth}\centering
+    \includegraphics[width=\linewidth]{figures/hres_large.pdf}
+    \textsf{L} model, per-matrix
+\end{minipage}
+\begin{minipage}{0.24\linewidth}\centering
+    \includegraphics[width=\linewidth]{figures/hres_prod_small.pdf}
+    \textsf{S} model, prod
+\end{minipage}
+\begin{minipage}{0.24\linewidth}\centering
+    \includegraphics[width=\linewidth]{figures/hres_prod_large.pdf}
+    \textsf{L} model, prod
+\end{minipage}
+\caption{\textbf{Column sums of ${\boldsymbol{H}}^{\text{res}}$.} We compute column sums for token-level ${\boldsymbol{H}}^{\text{res}}$ matrices and summarize their distribution with standard boxplots (points indicate outliers). \textbf{per-matrix}: statistics for individual ${\boldsymbol{H}}^{\text{res}}$ matrices. \textbf{prod}: statistics for the layer-wise product of ${\boldsymbol{H}}^{\text{res}}$ across all layers.}\label{fig:h_res}
+\end{figure*}
+
+
+\begin{figure*}[th]
+    \centering
+\begin{minipage}{0.49\linewidth}\centering
+    \includegraphics[width=\linewidth]{figures/nu_small.pdf}
+    \textsf{S} model
+\end{minipage}
+\hfill
+\begin{minipage}{0.49\linewidth}\centering  \includegraphics[width=\linewidth]{figures/nu_large.pdf}
+\textsf{L} model
+\end{minipage}
+\caption{\textbf{Distribution of $\log(1/\nu)$.} Distribution of the relative range $\log (1/\nu)$ (defined in \cref{eq:nu}) for \mHC before applying SK. Large values (e.g., $\log(1/\nu)>30$) suggest that 20 SK iterations may not converge well to a doubly stochastic matrix. }\label{fig:nu}
+\end{figure*}
+
+\section{Experiments}
+\label{sec: exp}
+To evaluate the effectiveness of \mHC-lite, we implement \mHC-lite in language models by replacing the original residual connections, and assess its impact on both training efficiency and model performance across various scales and datasets. Specifically, we adopt the nanoGPT framework~\cite{karpathy2022nanogpt} and adopt three model scales: \textsf{S} (6 layers, $\sim$45M parameters), \textsf{M} (12 layers, $\sim$0.12B parameters), and \textsf{L} (24 layers, $\sim$0.36B parameters). For training data, we use \texttt{OpenWebText} and \texttt{FineWeb-Edu}. Following the implementation in \cite{xie25mhc}, throughout this paper $n$ is set to $4$. Due to computational constraints, we use a relatively small number of training iterations (10,000 steps, approximately 1.3B tokens in total). Further details of the hyperparameters are provided in \Cref{sec:exp-details}.
+
+\paragraph{Initialization.} We initialize the parameters in the HC/\mHC/\mHC-lite blocks so that, at initialization, each block reduces to an ordinary residual connection. Concretely, in all variants, ${\boldsymbol{W}}_l^\text{pre}$, ${\boldsymbol{W}}_l^\text{post}$, and ${\boldsymbol{W}}_l^\text{res}$ are initialized to zero, while $\alpha_l^\text{pre}$, $\alpha_l^\text{post}$, and $\alpha_l^\text{res}$ are initialized to $0.01$. The bias vectors ${\boldsymbol{b}}_l^\text{pre}$ and ${\boldsymbol{b}}_l^\text{post}$ are set to $-1$ in all entries except for a single entry set to $1$. For \mHC, ${\boldsymbol{b}}_l^\text{res}$ is set to $-8$ for all entries except the diagonal, which is set to $0$, so that after exponentiation it closely approximates the identity matrix. For \mHC-lite, ${\boldsymbol{b}}_l^\text{res}$ is set to $-8$ for all entries except the entry corresponding to the identity matrix, which is set to $0$, so that after the $\mathop{\mathrm{softmax}}$ operation the weights concentrate on the identity matrix.
+
+
+\subsection{Performance and Training Stability}To verify whether \mHC-lite achieves improvements in model loss comparable to those of \mHC, we compare the final training and validation losses of models with different residual connection components in \Cref{tab:loss}. The results clearly demonstrate that \mHC-lite achieves performance on par with \mHC or even slightly better across all datasets and model scales. 
+
+Furthermore, \Cref{fig:grad-norm} presents the gradient norm curves for a specific configuration (the \textsf{L} model trained on \texttt{FineWeb-Edu}). The results indicate that \mHC-lite exhibits the same stabilizing effect on training as \mHC. Moreover, a closer examination of the curves (\Cref{fig:grad-norm} right) reveals that the gradient norm of \mHC-lite is slightly lower than that of \mHC, further confirming its effectiveness in stabilizing training dynamics.
+
+
+\subsection{Efficiency}
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/token_per_sec.pdf}
+\caption{\textbf{Token throughput during training.} We report training throughput in tokens/s, computed as the number of tokens per batch divided by the wall-clock time of each optimizer update and averaged over the entire training run. All experiments are run on a single node with 8$\times$ NVIDIA A100 80GB (SXM4) GPUs. Notice that the \mHC result is based on our PyTorch re-implementation and may underestimate the throughput of the specialized-kernel implementation in \citet{xie25mhc}, which is reported to incur only a $6.7\%$ overhead relative to HC.}
+    \label{fig:token_per_second}
+\end{figure}
+
+
+
+We compare the computational efficiency of \mHC-lite to HC by measuring the average training throughput (number of tokens per second) on the \texttt{OpenWebText} dataset using the \textsf{M} model. Results are reported in \Cref{fig:token_per_second}. Unless otherwise noted, all methods are implemented by us in PyTorch under the same training setup.
+
+We have also included the \mHC results in \Cref{fig:token_per_second}. It is important to note that \citet{xie25mhc} accelerates \mHC using a specialized kernel, which is not publicly available at the time of writing. Therefore, the \mHC throughput reported in \Cref{fig:token_per_second} is based on our PyTorch re-implementation and may underestimate the performance achievable with custom kernels. 
+
+Even with this caveat, the authors of \mHC claimed that with their optimized \mHC implementation, \mHC still incurs a $6.7\%$ overhead relative to HC \cite{xie25mhc}, whereas \mHC-lite achieves higher throughput than HC even \emph{without any system-level optimization}. This result suggests that \mHC-lite is highly implementation-friendly, making it easy to integrate into existing training code and practical systems.
+
+
+
+
+\subsection{Stability Analysis}
+
+In this section, we address the following question: \emph{Are the ${\boldsymbol{H}}^{\text{res}}_l$ matrices in \mHC really as stable as claimed in \citet{xie25mhc}?} To answer this, we follow the methodology in Section~5.4 of \citet{xie25mhc} and assess how close ${\boldsymbol{H}}^{\text{res}}_l$ is to being doubly stochastic. However, rather than analyzing \emph{token-averaged} matrices as in \citet{xie25mhc}, we collect matrices at each token and compute statistics over the resulting population. We argue that this procedure more faithfully reflects the behavior of ${\boldsymbol{H}}^{\text{res}}_l$, since averaging across tokens can hide potential instability. Concretely, for the experiments in this section, we first take the trained model and then run it on the first 64 sequences of the training set (each of length 1024). At every layer and every token, we record ${\boldsymbol{H}}^{\text{res}}_l$ and other related matrices, and report statistics over all collected matrices.
+
+We begin with the relative range $1/\nu$ (defined in \cref{eq:nu}). The theoretical analysis for the SK algorithm suggests that convergence can be poor when $\log(1/\nu)$ is significantly larger than the number of SK iterations. In \Cref{fig:nu}, we report the distribution of $1/\nu$ for \mHC before applying SK. The left and right panels of \Cref{fig:nu} present the results for a 6-layer model and 24-layer model respectively. 
+The results show that the fixed number of iteration, 20 times, taken by \mHC, is indeed a reasonable choice for balancing the converge rate and running time. 
+On the other hand, however, there are also a non-negligible fraction of outliers with $\log(1/\nu) > 30$, i.e., $1/\nu >10^{13}$, a regime in which 20 SK iterations may not converge well to the Birkhoff polytope. 
+By comparing the left and right panels, we further find that the relative range $1/\nu$ is generally larger for deeper models. This implies that the fixed 20 SK iterations might not be generically sufficient for deeper networks. 
+
+To show this issue more explicitly, we further directly examine the distribution of column sums of ${\boldsymbol{H}}^{\text{res}}_l$ for \mHC (\mHC-lite guarantees that ${\boldsymbol{H}}^{\text{res}}_l$ is strictly doubly stochastic).  
+As shown in \Cref{fig:h_res}, although the median column sum for an individual ${\boldsymbol{H}}^{\text{res}}_l$ is typically close to $1$, there exist many outliers that deviate substantially from $1$. Moreover, when we consider the composition $\prod_l{\boldsymbol{H}}^{\text{res}}_l$ across layers, even the median can drift far from $1$. Similarly, by comparing the composition $\prod_l{\boldsymbol{H}}^{\text{res}}_l$ for 6-layer models and 24-layer models, we find that the deviation is more severe when a model scales up, which implies the potential risks of instability when a model further scales up.
+
+In contrast, \mHC-lite does not rely on iterative normalization and therefore avoids convergence-related failure. For \mHC-lite, the perfect doubly stochasticity of ${\boldsymbol{H}}^{\text{res}}_l$ and its composition $\prod_l{\boldsymbol{H}}^{\text{res}}_l$ is guaranteed by construction via the Birkhoff-von Neumann theorem.
+
+
+
+
