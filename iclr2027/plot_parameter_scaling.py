@@ -32,6 +32,9 @@ def parameters_per_hyper_connection(method: str, n: int) -> int:
         return common + DIM * n**3 + n**2
     if method == "mHC-lite":
         return common + (DIM * n + 1) * factorial(n)
+    if method == "KromHC (binary modes)":
+        # For n=2^K and i_r=2, prod_r i_r! = 2^K = n.
+        return common + (DIM * n + 1) * n
     raise ValueError(f"Unknown method: {method}")
 
 
@@ -48,8 +51,8 @@ def compact_count(value: float) -> str:
 
 
 def main() -> None:
-    methods = ["ITO-HC", "mHC (Sinkhorn)", "mHC-lite"]
-    colors = ["#2A7F62", "#416788", "#C65D3B"]
+    methods = ["ITO-HC", "mHC (Sinkhorn)", "KromHC (binary modes)", "mHC-lite"]
+    colors = ["#2A7F62", "#416788", "#7A6FA8", "#C65D3B"]
     values = {
         method: np.array([total_parameters(method, int(n)) for n in STREAMS], dtype=float)
         for method in methods
@@ -70,13 +73,13 @@ def main() -> None:
         }
     )
 
-    fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.65), gridspec_kw={"wspace": 0.30})
+    fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.65), gridspec_kw={"wspace": 0.34})
     x = np.arange(len(STREAMS))
-    width = 0.24
+    width = 0.18
 
     ax = axes[0]
     for index, (method, color) in enumerate(zip(methods, colors)):
-        positions = x + (index - 1) * width
+        positions = x + (index - 1.5) * width
         bars = ax.bar(
             positions,
             values[method],
@@ -100,21 +103,23 @@ def main() -> None:
                     rotation=25,
                 )
     ax.set_yscale("log")
-    ax.set_ylim(1.5e8, 2e43)
+    ax.set_ylim(3e8, 1e44)
     ax.set_xticks(x, STREAMS)
     ax.set_xlabel("Number of streams, $n$")
     ax.set_ylabel("Total trainable parameters")
-    ax.set_title("(a) All methods (log scale)", loc="left")
+    ax.set_title("(a) All methods", loc="left")
     ax.grid(axis="y", which="major", color="#D7D7D7", linewidth=0.5, zorder=0)
     ax.legend(frameon=False, loc="upper left")
 
     ax = axes[1]
-    for index, (method, color) in enumerate(zip(methods[:2], colors[:2])):
-        positions = x + (index - 0.5) * 0.34
+    detail_methods = methods[:3]
+    detail_colors = colors[:3]
+    for index, (method, color) in enumerate(zip(detail_methods, detail_colors)):
+        positions = x + (index - 1) * 0.25
         bars = ax.bar(
             positions,
-            values[method] / 1e6,
-            width=0.34,
+            values[method],
+            width=0.24,
             color=color,
             edgecolor="white",
             linewidth=0.45,
@@ -131,12 +136,13 @@ def main() -> None:
                 va="bottom",
                 fontsize=6.5,
             )
-    ax.set_ylim(0, 2_260)
+    ax.set_yscale("log")
+    ax.set_ylim(3e8, 3e9)
     ax.set_xticks(x, STREAMS)
     ax.set_xlabel("Number of streams, $n$")
-    ax.set_ylabel("Total trainable parameters (millions)")
+    ax.set_ylabel("Total trainable parameters")
     ax.set_title("(b) Practical-range detail", loc="left")
-    ax.grid(axis="y", color="#D7D7D7", linewidth=0.5, zorder=0)
+    ax.grid(axis="y", which="both", color="#D7D7D7", linewidth=0.5, zorder=0)
     ax.legend(frameon=False, loc="upper left")
 
     for ax in axes:
