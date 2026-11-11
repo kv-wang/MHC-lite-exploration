@@ -756,6 +756,8 @@ class ManifoldConstrainedHyperConnections(Module):
         mhc_h_res_random_init_logit_scale = 1.,
         mhc_h_res_offdiag_init_scale = 0.05,
         mhc_h_res_offdiag_trainable = True,
+        mhc_h_res_diag_trainable = False,
+        mhc_h_res_diag_unbounded = False,
         mhc_disable_dynamic_h_res = False,
         mhc_disable_dynamic_pre_post = False,
         mhc_disable_dynamic_h_pre = False,
@@ -801,6 +803,11 @@ class ManifoldConstrainedHyperConnections(Module):
             raise ValueError("mhc_h_res_random_init_logits=True is only supported when mhc_h_res_mode='sinkhorn'")
         if mhc_h_res_offdiag_init_scale <= 0:
             raise ValueError("mhc_h_res_offdiag_init_scale must be > 0")
+        if (mhc_h_res_diag_trainable or mhc_h_res_diag_unbounded) and mhc_h_res_mode != "identity_tanh_offdiag":
+            raise ValueError(
+                "trainable/unbounded diagonal options are only supported for "
+                "mhc_h_res_mode='identity_tanh_offdiag'"
+            )
         if mhc_disable_dynamic_h_res and mhc_h_res_mode not in DYNAMIC_H_RES_DISABLED_MODES:
             raise ValueError(
                 f"mhc_disable_dynamic_h_res=True is only supported for modes "
@@ -939,6 +946,20 @@ class ManifoldConstrainedHyperConnections(Module):
                 self.register_buffer("h_res_offdiag_log_scale", offdiag_log_scale)
             self._fixed_h_res_offdiag_log_scale_initial = self.h_res_offdiag_log_scale.detach().clone()
 
+        # Either option enables direct, unconstrained optimization of the
+        # diagonal entries. Keeping both names is useful in configs that spell
+        # out either intent; both produce the same raw parameterization.
+        if (
+            mhc_h_res_mode == "identity_tanh_offdiag"
+            and (mhc_h_res_diag_trainable or mhc_h_res_diag_unbounded)
+        ):
+            self.h_res_diag = nn.Parameter(
+                torch.ones(num_residual_streams_fracs),
+                requires_grad=not mhc_freeze_h_res,
+            )
+        else:
+            self.register_parameter("h_res_diag", None)
+
         # depth connection related (beta)
 
         self.add_branch_out_to_residual = add_branch_out_to_residual
@@ -987,6 +1008,8 @@ class ManifoldConstrainedHyperConnections(Module):
         self.mhc_h_res_random_init_logit_scale = mhc_h_res_random_init_logit_scale
         self.mhc_h_res_offdiag_init_scale = mhc_h_res_offdiag_init_scale
         self.mhc_h_res_offdiag_trainable = mhc_h_res_offdiag_trainable
+        self.mhc_h_res_diag_trainable = bool(mhc_h_res_diag_trainable)
+        self.mhc_h_res_diag_unbounded = bool(mhc_h_res_diag_unbounded)
         self.mhc_disable_dynamic_h_res = mhc_disable_dynamic_h_res
         self.mhc_disable_dynamic_pre_post = mhc_disable_dynamic_pre_post
         self.mhc_disable_dynamic_h_pre = mhc_disable_dynamic_h_pre
@@ -1158,7 +1181,11 @@ class ManifoldConstrainedHyperConnections(Module):
 
     def identity_tanh_offdiag_h_res(self, h_res_logits):
         eye, offdiag_mask, gamma = self.identity_offdiag_base(h_res_logits)
-        return eye + gamma * offdiag_mask * h_res_logits.tanh()
+        h_res = eye + gamma * offdiag_mask * h_res_logits.tanh()
+        if self.h_res_diag is not None:
+            diag = self.h_res_diag.to(device=h_res.device, dtype=h_res.dtype)
+            h_res = h_res + torch.diag(diag - 1.)
+        return h_res
 
     def identity_clip_offdiag_h_res(self, h_res_logits):
         eye, offdiag_mask, gamma = self.identity_offdiag_base(h_res_logits)

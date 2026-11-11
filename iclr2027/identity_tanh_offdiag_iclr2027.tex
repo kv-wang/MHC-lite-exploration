@@ -26,7 +26,7 @@
 \maketitle
 
 \begin{abstract}
-Hyper-Connections (HC) widen the residual state and learn dynamic read, write, and stream-mixing maps. Manifold-Constrained Hyper-Connections (mHC) stabilize these maps by constraining the residual mixer to the Birkhoff polytope, but repeated nonnegative mixing can suppress stream-difference directions and finite Sinkhorn iterations introduce projection error. We propose \emph{ITO-HC}, an identity-centered, input-independent residual mixer that adds bounded, signed off-diagonal corrections while preserving an exact unit diagonal. ITO-HC retains the mHC-style dynamic pre/post routers and nonlinear Transformer branches, combining an explicit residual highway with controlled cross-stream interactions. We derive a layer-attention formulation that exposes the low-rank dense routing structure of the identity-residual baseline, and we establish conditional perturbation and spectral stability bounds for ITO-HC. Experiments on OpenWebText with GPT-2-style models compare ITO-HC with identity, mHC, mHC-lite, and a single-stream residual baseline across multiple stream widths. The results support the proposed stability--capacity trade-off while highlighting the need for further scale and routing-diagnostic studies.
+Hyper-Connections (HC) widen the residual state and learn dynamic read, write, and stream-mixing maps. Manifold-Constrained Hyper-Connections (mHC) stabilize these maps by constraining the residual mixer to the Birkhoff polytope, but repeated nonnegative mixing can suppress stream-difference directions and finite Sinkhorn iterations introduce projection error. We propose \emph{ITO-HC}, an identity-centered, input-independent residual mixer that adds bounded, signed off-diagonal corrections while preserving an exact unit diagonal. ITO-HC retains the mHC-style dynamic pre/post routers and nonlinear Transformer branches, combining an explicit residual highway with controlled cross-stream interactions. We derive a layer-attention formulation that exposes the low-rank dense routing structure of the identity-residual baseline, and we establish conditional perturbation and spectral stability bounds for ITO-HC. Experiments on OpenWebText with GPT-2-style models report width sweeps for iHC and ITO-HC and $n=4$ comparisons with mHC, mHC-lite, and KromHC. These results are exploratory and do not establish a general performance advantage at larger stream counts; further scale and routing-diagnostic studies are needed.
 \end{abstract}
 
 \section{Introduction}
@@ -46,7 +46,7 @@ We ask whether a fully learned residual mixer is necessary when the pre/post rou
 \end{equation}
 where $S_l=b_l^{\mathrm{res}}$ is a learned layer-specific static residual-logit matrix and $\gamma_l>0$ controls the maximum off-diagonal magnitude. We call this parameterization ITO-HC. It preserves the self highway, permits signed cross-stream corrections, and avoids a depth-long chain of strictly positive averages.
 
-Our contributions are: we formulate ITO-HC and connect it to the layer-attention view of HC; characterize the rank-$n$ dense channel kernel induced by iHC while explaining why the causal mask and dynamic routers prevent it from fully characterizing network expressivity; give perturbation and spectral-norm conditions for the identity-centered residual path and compare its scaling with dynamic mHC and mHC-lite; and evaluate the method on OpenWebText with GPT-2-style models over $n\in\{4,8,16,32,64\}$.
+Our contributions are: we formulate ITO-HC and connect it to the layer-attention view of HC; characterize the rank-$n$ dense channel kernel induced by iHC while explaining why the causal mask and dynamic routers prevent it from fully characterizing network expressivity; give perturbation and spectral-norm conditions for the identity-centered residual path and compare its scaling with dynamic mHC and mHC-lite; and report an OpenWebText width sweep for iHC and ITO-HC at $n\in\{4,8,16,32,64\}$, alongside $n=4$ comparisons with mHC, mHC-lite, and KromHC.
 \section{Background and Implementation}
 
 \subsection{Related work}
@@ -445,10 +445,10 @@ This conclusion is a sufficient conditional guarantee, not an unconditional prop
 
 We pretrain decoder-only GPT-2-style models \citep{radford2019language} on OpenWebText \citep{gokaslan2019openwebtext} with the nanoGPT-derived repository \citep{karpathy2022nanogpt}. The S/M/L configurations have $(6,8,512)$, $(12,12,768)$, and $(24,16,1024)$ layers/heads/width. Runs use length 1024, micro-batch 2, accumulation 128, bfloat16 AdamW \citep{loshchilov2019decoupled}, weight decay $0.1$, gradient clipping $1.0$, and 10,000 iterations; learning rates are $10^{-3},6\times10^{-4},3\times10^{-4}$ with 200 warm-up iterations and cosine decay to one-tenth.
 
-For identity, ITO-HC, and mHC we sweep $n\in\{4,8,16,32,64\}$. Identity fixes $\Hres=I$; ITO-HC uses Eq.~\ref{eq:full-method} with a static $S_l=b_l^{\mathrm{res}}$, dynamic pre/post routers, and $\gamma_l$ initialized to $0.05$; mHC uses its standard dynamic residual parameterization and Sinkhorn projection. We also include the single-stream residual baseline and mHC-lite at $n=4$. All multi-stream comparisons use the repository's $4$-mean reducer and repeated initial expansion. Table~\ref{tab:experiments} reports the currently available losses; missing entries remain explicit rather than being imputed.
+We sweep the stream count $n\in\{4,8,16,32,64\}$ for iHC and ITO-HC. Identity fixes $\Hres=I$; ITO-HC uses Eq.~\ref{eq:full-method} with a static $S_l=b_l^{\mathrm{res}}$, dynamic pre/post routers, and $\gamma_l$ initialized to $0.05$. The mHC, mHC-lite, and KromHC comparisons are available only at $n=4$; mHC uses its standard dynamic residual parameterization and Sinkhorn projection. We also include the single-stream residual baseline. All multi-stream comparisons use the repository's $4$-mean reducer and repeated initial expansion. Table~\ref{tab:experiments} reports the currently available losses; missing entries remain explicit rather than being imputed. These are single-run point estimates without seed-replicated uncertainty. The width-wise losses are descriptive and do not establish a general or increasing ITO-HC advantage as $n$ grows, particularly at the larger, resource-intensive stream counts.
 
 \begin{table}[H]
-\caption{Available last-iteration OpenWebText losses after 10,000 iterations.}
+\caption{Available last-iteration OpenWebText losses after 10,000 iterations. iHC and ITO-HC are evaluated at $n\in\{4,8,16,32,64\}$; mHC, mHC-lite, and KromHC are evaluated at $n=4$.}
 \label{tab:experiments}
 \begin{center}
 {\setlength{\tabcolsep}{2pt}
@@ -561,10 +561,12 @@ self highway and permits controlled cross-stream interactions.
 \item \textbf{Analysis.} For ITO-HC, perturbation analysis
 gives conditional lower and upper bounds on the residual-path singular
 spectrum under a controlled cumulative perturbation budget.
-\item \textbf{Empirical comparison.} OpenWebText experiments compare ITO-HC
-with iHC, mHC, mHC-lite, KromHC, and a single-stream residual baseline across
-multiple stream widths. The results support the proposed training stability of ITO-HC, while larger-scale training and broader routing diagnostics remain
-important directions for future work.
+\item \textbf{Empirical comparison.} OpenWebText experiments report iHC and
+ITO-HC across multiple stream widths and compare them with mHC, mHC-lite,
+KromHC, and a single-stream residual baseline at $n=4$.
+These results are exploratory and do not establish a general or increasing
+performance advantage at larger stream counts; larger-scale training and
+broader routing diagnostics remain important directions for future work.
 \end{itemize}
 
 \subsection*{AI use statement}
@@ -622,7 +624,7 @@ This expansion shows signed cross-stream paths, but does not by itself prove a
 larger matrix rank. A sharper algebraic statement follows when every
 $\Hres_k$ is invertible. Define
 \begin{equation}
- G_t=\Hres_t\Hres_{t-1}\cdots\Hres_1,\qquad G_0=I.
+ G_t=\Hres_t\Hres_{t-1}\cdots\Hres_1,\mspace{36mu} G_0=I.
  \label{eq:app-g-products}
 \end{equation}
 Then
@@ -637,7 +639,7 @@ and hence
 \end{equation}
 Consequently, the corresponding unmasked completion remains
 \begin{equation}
- C_{\mathrm{ITO\text{-}HC}}=\widehat P\widehat Q^\top,qquad
+ C_{\mathrm{ITO\text{-}HC}}=\widehat P\widehat Q^\top,\mspace{36mu}
  \operatorname{rank}(C_{\mathrm{ITO\text{-}HC}})\le n.
  \label{eq:ito-rank}
 \end{equation}
@@ -652,12 +654,12 @@ This subsection isolates the role of the residual mixer by fixing the read and
 write routers.  Let $a_l=\Hpre_l$ and $b_l=\Hpost_l$ be fixed, let
 $H_l=\Hres_l$, and write
 \begin{equation}
- X_{l+1}=H_lX_l+b_ly_l,\qquad y_l=f_l(a_lX_l).
+ X_{l+1}=H_lX_l+b_ly_l,\mspace{36mu} y_l=f_l(a_lX_l).
  \label{eq:fixed-routing-update}
 \end{equation}
 For $0\leq k\leq L$, define the ordered product
 \begin{equation}
- T_{L,k}=H_{L-1}H_{L-2}\cdots H_k,\qquad T_{L,L}=I.
+ T_{L,k}=H_{L-1}H_{L-2}\cdots H_k,\mspace{36mu} T_{L,L}=I.
  \label{eq:fixed-routing-product}
 \end{equation}
 Repeated substitution gives
@@ -667,14 +669,14 @@ Repeated substitution gives
 \end{equation}
 Define
 \begin{equation}
- B_L^{(H)}=\begin{bmatrix}T_{L,1}b_0&T_{L,2}b_1&\cdots&b_{L-1}\end{bmatrix},\qquad
+ B_L^{(H)}=\begin{bmatrix}T_{L,1}b_0&T_{L,2}b_1&\cdots&b_{L-1}\end{bmatrix},\mspace{36mu}
  Y_L=\begin{bmatrix}y_0\\y_1\\\vdots\\y_{L-1}\end{bmatrix}.
  \label{eq:fixed-routing-by}
 \end{equation}
 The accumulated branch write relative to the transported initial state is
 therefore
 \begin{equation}
- X_L-T_{L,0}X_0=B_L^{(H)}Y_L,\qquad
+ X_L-T_{L,0}X_0=B_L^{(H)}Y_L,\mspace{36mu}
  \operatorname{rank}(B_L^{(H)}Y_L)\leq\min\{n,L,C\}.
  \label{eq:fixed-routing-write-rank}
 \end{equation}
@@ -749,7 +751,7 @@ The preceding variation fixes the read and write routers to isolate the direct
 effect of $H_l^{\mathrm{res}}$. In the implemented HC block, the routers are
 state-dependent. Write
 \begin{equation}
- a_l(X_l)=\Hpre_l(X_l)\in\R^{1\times n},\qquad
+ a_l(X_l)=\Hpre_l(X_l)\in\R^{1\times n},\mspace{36mu}
  b_l(X_l)=\Hpost_l(X_l)\in\R^{n\times1},
  \label{eq:dynamic-residual-router-def}
 \end{equation}
@@ -764,9 +766,9 @@ $\bar b_l=b_l(\bar X_l)$, $\bar z_l=\bar a_l\bar X_l$, and
 $\bar y_l=f_l(\bar z_l)$. For a perturbation direction $U$, define
 \begin{equation}
  \dot z_l[U]=\bar a_lU+(Da_l(\bar X_l)[U])\bar X_l,
- \qquad
+ \mspace{36mu}
  \dot y_l[U]=J_l\dot z_l[U],
- \qquad J_l=Df_l(\bar z_l).
+ \mspace{36mu} J_l=Df_l(\bar z_l).
  \label{eq:dynamic-residual-first-read}
 \end{equation}
 The first term in $\dot z_l$ is the fixed read path, while the second is the
@@ -792,7 +794,7 @@ not only through the product of residual mixers.
 For completeness, let
 \begin{equation}
  X_l(\epsilon)=\bar X_l+\epsilon U_l+\frac{\epsilon^2}{2}V_l+O(\epsilon^3),
- \qquad
+ \mspace{36mu}
  V_l=\left.\frac{d^2X_l}{d\epsilon^2}\right|_{\epsilon=0}.
  \label{eq:dynamic-residual-taylor}
 \end{equation}
@@ -871,20 +873,20 @@ dimension even when the feature coefficients are unrestricted. If both factors
 were allowed to vary freely, the largest fixed-rank envelope would be the
 determinantal variety
 \begin{equation}
- \mathcal D_L:=\{M\in\R^{n\times C}:\operatorname{rank}(M)\leq L\},qquad
+ \mathcal D_L:=\{M\in\R^{n\times C}:\operatorname{rank}(M)\leq L\},\mspace{36mu}
  \dim\mathcal D_L=L(n+C-L).
  \label{eq:rank-variety}
 \end{equation}
 
 For static pre and post routers, $b_l(X_l)=b_l^0$ and
 \begin{equation}
- B_L(X)=B_L^0=\begin{bmatrix}b_0^0&\cdots&b_{L-1}^0\end{bmatrix},qquad
+ B_L(X)=B_L^0=\begin{bmatrix}b_0^0&\cdots&b_{L-1}^0\end{bmatrix},\mspace{36mu}
  U_X=U_0:=\operatorname{col}(B_L^0),
  \label{eq:static-routing-basis}
 \end{equation}
 so all relaxed updates use the same space
 \begin{equation}
- \mathcal S_{\mathrm{static}}=\{B_L^0Y:Y\in\R^{L\times C}\},qquad
+ \mathcal S_{\mathrm{static}}=\{B_L^0Y:Y\in\R^{L\times C}\},\mspace{36mu}
  \dim\mathcal S_{\mathrm{static}}=\operatorname{rank}(B_L^0)C\leq LC.
  \label{eq:static-output-space}
 \end{equation}
@@ -893,21 +895,21 @@ create new stream-side basis directions when post routing is static.
 
 With dynamic post routing,
 \begin{equation}
- B_L(X)=\begin{bmatrix}b_0(X_0)&\cdots&b_{L-1}(X_{L-1})\end{bmatrix},qquad
+ B_L(X)=\begin{bmatrix}b_0(X_0)&\cdots&b_{L-1}(X_{L-1})\end{bmatrix},\mspace{36mu}
  U_X=\operatorname{col}(B_L(X)).
  \label{eq:dynamic-post-basis}
 \end{equation}
 If its rank is locally constant, $U_X$ is a point of
 $\mathrm{Gr}(r,n)$; the global stream span is
 \begin{equation}
- U_{\mathrm{global}}:=\operatorname{span}_{X\in\mathcal X}U_X,qquad
+ U_{\mathrm{global}}:=\operatorname{span}_{X\in\mathcal X}U_X,\mspace{36mu}
  r_{\mathrm{global}}:=\dim U_{\mathrm{global}}\leq n,
  \label{eq:global-dynamic-stream-space}
 \end{equation}
 and the span of the relaxed envelopes has dimension $r_{\mathrm{global}}C$:
 \begin{equation}
  \operatorname{span}_{X\in\mathcal X}\mathcal S_X
- =U_{\mathrm{global}}\otimes\R^C,qquad
+ =U_{\mathrm{global}}\otimes\R^C,\mspace{36mu}
  \dim\!\left(\operatorname{span}_{X}\mathcal S_X\right)=r_{\mathrm{global}}C.
  \label{eq:global-dynamic-output-space}
 \end{equation}
@@ -977,12 +979,12 @@ while KromHC additionally tests selected larger widths
 baseline, but controlled width scaling changes both intermediate capacity and
 output scale.
 
-The capacity benefit of multiple streams is most transparent before the final
+The capacity role of multiple streams is most transparent before the final
 stream reducer. Under the identity-residual abstraction used in
 Section~\ref{sec:dynamic-pre-post}, the cumulative branch update is
 \begin{equation}
  \Delta_L(X):=X_L-X_0=B_L(X)Y_L(X),
- \qquad B_L(X)\in\R^{n\times L},\quad Y_L(X)\in\R^{L\times C}.
+ \mspace{36mu} B_L(X)\in\R^{n\times L},\quad Y_L(X)\in\R^{L\times C}.
  \label{eq:stream-scaling-update}
 \end{equation}
 For a fixed input, let $U_X=\operatorname{col}(B_L(X))$ and
@@ -991,7 +993,7 @@ relaxed to range over $Y\in\R^{L\times C}$, the corresponding linear envelope
 is
 \begin{equation}
  \mathcal S_X=\{B_L(X)Y:Y\in\R^{L\times C}\},
- \qquad \dim\mathcal S_X=r_XC\leq\min(n,L)C.
+ \mspace{36mu} \dim\mathcal S_X=r_XC\leq\min(n,L)C.
  \label{eq:stream-scaling-space}
 \end{equation}
 The inequality follows because $B_L(X)$ has only $L$ columns. Thus $n$
@@ -1030,12 +1032,13 @@ $\operatorname{rank}(\Delta_L(X))\leq L<n$, so increasing $n$ beyond $L$ does
 not continue to raise the rank ceiling of one fixed-input cumulative update. It
 can nevertheless enlarge the ambient residual state, the family of
 input-conditioned stream subspaces $\operatorname{col}(B_L(X))$, and the state
-trajectories seen by later nonlinear branches. Consequently, improvements for
-$n>L$ should be interpreted as benefits from state-space geometry and
-conditional routing, not as evidence that the per-input low-rank bound has
-disappeared.
+trajectories seen by later nonlinear branches. Consequently, any observed
+differences for $n>L$ should be interpreted in light of the changed state-space
+geometry and conditional routing; they do not imply that the per-input
+low-rank bound has disappeared or establish a performance advantage.
 
-Finally, the $n$-stream advantage is not contradicted by the final reducer. If
+Finally, the intermediate-state capacity described above is not removed by the
+final reducer. If
 the output head receives $r^\top X_L$ for a fixed reducer vector $r$, then the
 final merged update is a $1\times C$ vector. The relevant capacity gain occurs
 before this merge: subsequent attention and MLP branches can read stream
@@ -1066,8 +1069,9 @@ therefore use the normalized reducer
 \end{equation}
 where the factor $4$ gives the $n=4$ setting the historical sum gain while
 preventing output gain from growing with $n$. This convention is used for
-identity, ITO-HC, and the mHC stream-width sweep; the single-stream residual
-baseline uses its ordinary identity output. Identity and ITO-HC add
+the iHC and ITO-HC width sweeps and for the $n=4$ multi-stream comparisons,
+including mHC; the single-stream residual baseline uses its ordinary identity
+output. Identity and ITO-HC add
 $O(dn^2)$ router parameters per hyper-connection, whereas fully dynamic mHC
 adds an $O(dn^3)$ residual generator.
 
@@ -1093,9 +1097,9 @@ where $n=\prod_{r=1}^{K}i_r$ for KromHC. For binary modes, $\prod_r i_r!=n$; thi
 \label{app:ds-proof}
 Let $\mathcal B_n$ denote the set of doubly stochastic matrices, and use the shorthand
 \begin{equation}
- H_l:=\Hres_l,\qquad
+ H_l:=\Hres_l,\mspace{36mu}
  J_n:=\frac{1}{n}\mathbf 1\mathbf 1^\top,
- \qquad
+ \mspace{36mu}
  P:=I-J_n.
  \label{eq:app-ds-projectors}
 \end{equation}
@@ -1104,7 +1108,7 @@ $u:=\mathbf 1/\sqrt n$ is a unit vector. Define the mean and difference
 subspaces
 \begin{equation}
  U:=\operatorname{span}\{\mathbf 1\}=\operatorname{span}\{u\},
- \qquad
+ \mspace{36mu}
  V:=\mathbf 1^\perp
  =\{v\in\mathbb R^n:\mathbf 1^\top v=0\}.
  \label{eq:app-ds-subspaces}
@@ -1116,7 +1120,7 @@ Fix a layer $l$ and suppose $H_l\in\mathcal B_n$. The two doubly stochastic
 identities are
 \begin{equation}
  H_l\mathbf 1=\mathbf 1,
- \qquad
+ \mspace{36mu}
  \mathbf 1^\top H_l=\mathbf 1^\top.
  \label{eq:app-ds-identities}
 \end{equation}
@@ -1128,9 +1132,9 @@ then
 so $H_lv\in V$ and $V$ is invariant as well. Moreover,
 \begin{equation}
  H_lJ_n=J_n,
- \qquad
+ \mspace{36mu}
  J_nH_l=J_n,
- \qquad
+ \mspace{36mu}
  PH_lP=H_l-J_n.
  \label{eq:app-ds-projection-identities}
 \end{equation}
@@ -1149,7 +1153,7 @@ give the block decomposition
   1 & 0\\
   0 & \widetilde H_l
  \end{bmatrix},
- \qquad
+ \mspace{36mu}
  \widetilde H_l:=Q^\top H_lQ\in\mathbb R^{(n-1)\times(n-1)}.
  \label{eq:app-ds-block}
 \end{equation}
@@ -1232,7 +1236,7 @@ Since $K_l$ is nonnegative and doubly stochastic,
 and therefore $\|K_l|_V\|_2\leq1$. It follows that
 \begin{equation}
  \rho_l\leq1-n\varepsilon,
- \qquad
+ \mspace{36mu}
  \|G_L-J_n\|_2\leq(1-n\varepsilon)^L.
  \label{eq:app-ds-uniform-bound}
 \end{equation}

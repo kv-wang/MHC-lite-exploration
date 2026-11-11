@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from model import GPT, GPTConfig
+from hyper_conn.mhc import ExpandStreams
 
 
 def str2bool(value: str | bool) -> bool:
@@ -48,6 +49,19 @@ def build_model_from_checkpoint(checkpoint: dict, device: str) -> GPT:
         model_args["mhc_disable_dynamic_h_res"] = False
     model = GPT(GPTConfig(**model_args))
     model.load_state_dict(strip_compile_prefix(checkpoint["model"]))
+    # The compressed iHC fast path returns an IdentityStreamState wrapper between
+    # layers. Analysis routines need explicit stream tensors, so switch to the
+    # equivalent materialized repeat path after restoring the identical weights.
+    if model.identity_stream_compressed:
+        model.expand_stream = ExpandStreams(
+            model.config.hyper_conn_n,
+            mode=model.config.hyper_conn_expand_stream_mode,
+            stream_dtype=model.config.mhc_stream_dtype,
+        )
+        for module in model.modules():
+            if hasattr(module, "mhc_identity_stream_compressed"):
+                module.mhc_identity_stream_compressed = False
+        model.identity_stream_compressed = False
     model.to(device)
     model.eval()
     return model

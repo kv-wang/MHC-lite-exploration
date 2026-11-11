@@ -15,11 +15,11 @@ cd "$SCRIPT_DIR"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.bandw.top}"
 
-N_GPUS="${N_GPUS:-4}"
+N_GPUS="${N_GPUS:-1}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-config/train_owt.py}"
 MODEL_CONFIG="${MODEL_CONFIG:-config/small_model.py}"
 WANDB_PROJECT="${WANDB_PROJECT:-mhc-lite}"
-NUM_STREAMS="${NUM_STREAMS:-}"
+NUM_STREAMS="${NUM_STREAMS:-4}"
 EXPAND_STREAM_MODE="${EXPAND_STREAM_MODE:-}"
 
 run_one() {

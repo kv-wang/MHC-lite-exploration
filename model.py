@@ -196,6 +196,8 @@ class GPTConfig:
     mhc_h_res_random_init_logit_scale: float = 1.0
     mhc_h_res_offdiag_init_scale: float = 0.05
     mhc_h_res_offdiag_trainable: bool = True
+    mhc_h_res_diag_trainable: bool = False
+    mhc_h_res_diag_unbounded: bool = False
     mhc_disable_dynamic_h_res: bool = False
     mhc_disable_dynamic_pre_post: bool = False
     mhc_disable_dynamic_h_pre: bool = False
@@ -259,6 +261,8 @@ class GPT(nn.Module):
                 mhc_h_res_random_init_logit_scale=config.mhc_h_res_random_init_logit_scale,
                 mhc_h_res_offdiag_init_scale=config.mhc_h_res_offdiag_init_scale,
                 mhc_h_res_offdiag_trainable=config.mhc_h_res_offdiag_trainable,
+                mhc_h_res_diag_trainable=config.mhc_h_res_diag_trainable,
+                mhc_h_res_diag_unbounded=config.mhc_h_res_diag_unbounded,
                 mhc_disable_dynamic_h_res=config.mhc_disable_dynamic_h_res,
                 mhc_disable_dynamic_pre_post=config.mhc_disable_dynamic_pre_post,
                 mhc_disable_dynamic_h_pre=config.mhc_disable_dynamic_h_pre,
