@@ -21,7 +21,7 @@ export DDP_TIMEOUT="${DDP_TIMEOUT:-1800}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-export WANDB_API_KEY="${WANDB_API_KEY:-}"
+export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 export WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.bandw.top}"
 
 N_GPUS="${N_GPUS:-4}"

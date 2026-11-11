@@ -1,0 +1,100 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyperFirstAtBeginDocument{\AtBeginDocument}
+\HyperFirstAtBeginDocument{\ifx\hyper@anchor\@undefined
+\global\let\oldcontentsline\contentsline
+\gdef\contentsline#1#2#3#4{\oldcontentsline{#1}{#2}{#3}}
+\global\let\oldnewlabel\newlabel
+\gdef\newlabel#1#2{\newlabelxx{#1}#2}
+\gdef\newlabelxx#1#2#3#4#5#6{\oldnewlabel{#1}{{#2}{#3}}}
+\AtEndDocument{\ifx\hyper@anchor\@undefined
+\let\contentsline\oldcontentsline
+\let\newlabel\oldnewlabel
+\fi}
+\fi}
+\global\let\hyper@last\relax 
+\gdef\HyperFirstAtBeginDocument#1{#1}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{he2016deep}
+\citation{zhu2024hyper}
+\citation{xie2026mhc}
+\citation{yang2026mhclite}
+\citation{zhou2026kromhc}
+\citation{liu2026shc}
+\citation{guo2026ohc}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\newlabel{eq:hc}{{1}{1}{Introduction}{equation.1.1}{}}
+\newlabel{eq:method-short}{{2}{1}{Introduction}{equation.1.2}{}}
+\citation{he2016deep,he2016identity}
+\citation{srivastava2015highway,huang2017densely}
+\citation{xie2023residual,mak2025residual,bhendawade2025m2r2,liu2025thoughtbubbles}
+\citation{zhu2024hyper}
+\citation{xie2026mhc}
+\citation{yang2026mhclite,zhou2026kromhc}
+\citation{guo2026ohc}
+\citation{liu2026shc}
+\citation{zhang2019rmsnorm,zhu2024hyper,xie2026mhc}
+\citation{ba2016layer,vaswani2017attention,hendrycks2016gelu}
+\citation{yang2026mhclite}
+\citation{zhou2026kromhc}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Background and Implementation}{2}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Related work}{2}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Multi-stream residual computation}{2}{subsection.2.2}\protected@file@percent }
+\newlabel{eq:update}{{3}{2}{Multi-stream residual computation}{equation.2.3}{}}
+\newlabel{eq:mhc-compact}{{4}{2}{Multi-stream residual computation}{equation.2.4}{}}
+\citation{zhu2024hyper}
+\citation{xie2026mhc}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Per-hyper-connection scaling with stream width $n$ and feature width $d$.}}{3}{table.1}\protected@file@percent }
+\newlabel{tab:scaling}{{1}{3}{Per-hyper-connection scaling with stream width $n$ and feature width $d$}{table.1}{}}
+\newlabel{eq:ito-compact}{{5}{3}{Multi-stream residual computation}{equation.2.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Scaling with the number of streams}{3}{subsection.2.3}\protected@file@percent }
+\newlabel{eq:large-total-params}{{6}{3}{Scaling with the number of streams}{equation.2.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Residual-mixer stability analysis}{3}{subsection.2.4}\protected@file@percent }
+\citation{sinkhorn1967diagonal,xie2026mhc}
+\citation{xie2026mhc}
+\citation{birkhoff1946,vonneumann1953,yang2026mhclite}
+\citation{zhou2026kromhc}
+\citation{liu2026shc}
+\citation{shuang2026deepseek}
+\citation{linial1998scaling,franklin1989scaling,knight2008sinkhorn,chakrabarty2021sinkhorn,yang2026mhclite}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Total trainable parameters for the 24-layer, $d=1024$ large model, including the shared backbone; both panels use logarithmic axes. Panel (a) compares ITO-HC, mHC, binary-mode KromHC, and mHC-lite; labels above the $n\geq 8$ mHC-lite bars show absolute counts. Panel (b) enlarges the practical range and labels totals in millions. KromHC uses binary factors $i_r=2$ for the tested widths $n=2^K$. Non-trainable buffers are excluded. }}{4}{figure.1}\protected@file@percent }
+\newlabel{fig:parameter-scaling}{{1}{4}{Total trainable parameters for the 24-layer, $d=1024$ large model, including the shared backbone; both panels use logarithmic axes. Panel (a) compares ITO-HC, mHC, binary-mode KromHC, and mHC-lite; labels above the $n\geq 8$ mHC-lite bars show absolute counts. Panel (b) enlarges the practical range and labels totals in millions. KromHC uses binary factors $i_r=2$ for the tested widths $n=2^K$. Non-trainable buffers are excluded}{figure.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Repeated DS mixing contracts stream differences.}{4}{section*.1}\protected@file@percent }
+\newlabel{eq:ds-contraction}{{8}{4}{Repeated DS mixing contracts stream differences}{equation.2.8}{}}
+\newlabel{eq:ds-smin-decay}{{9}{4}{Repeated DS mixing contracts stream differences}{equation.2.9}{}}
+\newlabel{eq:ds-projectors-main}{{10}{5}{Repeated DS mixing contracts stream differences}{equation.2.10}{}}
+\newlabel{eq:ds-stream-difference-decay}{{11}{5}{Repeated DS mixing contracts stream differences}{equation.2.11}{}}
+\newlabel{eq:ds-conditioning}{{12}{5}{Repeated DS mixing contracts stream differences}{equation.2.12}{}}
+\newlabel{eq:ds-dynamic-read}{{13}{5}{Repeated DS mixing contracts stream differences}{equation.2.13}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}ITO-HC}{6}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Parameterization}{6}{subsection.3.1}\protected@file@percent }
+\newlabel{eq:full-method}{{14}{6}{Parameterization}{equation.3.14}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Layer-attention derivation}{6}{subsection.3.2}\protected@file@percent }
+\newlabel{eq:aji}{{15}{6}{Layer-attention derivation}{equation.3.15}{}}
+\newlabel{eq:identity-a}{{16}{6}{Layer-attention derivation}{equation.3.16}{}}
+\newlabel{eq:rank}{{17}{6}{Layer-attention derivation}{equation.3.17}{}}
+\newlabel{eq:masked}{{18}{6}{Layer-attention derivation}{equation.3.18}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Role of dynamic pre/post routing}{7}{subsection.3.3}\protected@file@percent }
+\newlabel{sec:dynamic-pre-post}{{3.3}{7}{Role of dynamic pre/post routing}{subsection.3.3}{}}
+\newlabel{eq:dynamic-ab}{{19}{7}{Role of dynamic pre/post routing}{equation.3.19}{}}
+\newlabel{eq:identity-dynamic-map}{{20}{7}{Role of dynamic pre/post routing}{equation.3.20}{}}
+\newlabel{eq:dynamic-output-rank}{{21}{7}{Role of dynamic pre/post routing}{equation.3.21}{}}
+\@writefile{toc}{\contentsline {paragraph}{Fixed-input geometry.}{7}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Dynamic routing and input-conditioned spaces.}{7}{section*.3}\protected@file@percent }
+\newlabel{eq:dynamic-factor-summary}{{22}{7}{Dynamic routing and input-conditioned spaces}{equation.3.22}{}}
+\citation{horn2012matrix}
+\citation{radford2019language}
+\citation{gokaslan2019openwebtext}
+\citation{karpathy2022nanogpt}
+\citation{loshchilov2019decoupled}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Stability analysis}{8}{section.4}\protected@file@percent }
+\newlabel{eq:ef}{{23}{8}{Stability analysis}{equation.4.23}{}}
+\newlabel{eq:hbound}{{24}{8}{Stability analysis}{equation.4.24}{}}
+\newlabel{eq:ito-layer-smin}{{25}{8}{Stability analysis}{equation.4.25}{}}
+\newlabel{eq:ito-product-smin}{{26}{8}{Stability analysis}{equation.4.26}{}}
+\newlabel{eq:ito-uniform-smin}{{27}{8}{Stability analysis}{equation.4.27}{}}
+\newlabel{eq:prod-bound}{{28}{8}{Stability analysis}{equation.4.28}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Experiments}{8}{section.5}\protected@file@percent }
+\newlabel{sec:experiments}{{5}{8}{Experiments}{section.5}{}}
+\citation{xie2026mhc,yang2026mhclite,zhou2026kromhc}
